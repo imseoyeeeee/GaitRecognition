@@ -1,0 +1,134 @@
+data_cfg:
+  dataset_name: Gait3D
+  dataset_root: your_path            # <root>/<ID>/<CAM>/<SEQ>/{00-efd.pkl, 01-pose.pkl}  (datasets/merge_efd_pose.py)
+  dataset_partition: ./datasets/Gait3D/Gait3D.json
+  num_workers: 4
+  data_in_use: [true, true]          # sorted file order: [EFD, keypoints]
+  remove_no_gallery: false
+  cache: false
+  test_dataset_name: Gait3D
+
+evaluator_cfg:
+  enable_float16: true
+  restore_ckpt_strict: true
+  restore_hint: 60000
+  save_name: FreQait
+  eval_func: evaluate_probe_gallery
+  probe_gallery:
+    probe_json: ./datasets/Gait3D/Gait3D.json   # Gait3D official probes; every other test seq is gallery
+    probe_key: PROBE_SET
+    ranks: [1, 5, 10]
+    # For datasets without a probe list, select by sequence type / view instead:
+    # probe:   {types: ['02', '03']}
+    # gallery: {types: ['01']}
+    # exclude_same_view: false
+    # per_view: true
+  sampler:
+    batch_shuffle: false
+    batch_size: 1                    # must equal the number of GPUs
+    sample_type: all_ordered
+    frames_all_limit: 720
+  metric: euc # cos
+  transform:
+    - type: NoOperation              # EFD
+    - type: NoOperation              # keypoints
+
+loss_cfg:
+  - loss_term_weight: 1.0
+    margin: 0.2
+    type: TripletLoss
+    log_prefix: triplet
+  # Optional BNNeck + CE (as in SkeletonGait++): uncomment together with model_cfg.SeparateBNNecks
+  # - loss_term_weight: 1.0
+  #   scale: 16
+  #   type: CrossEntropyLoss
+  #   log_prefix: softmax
+  #   log_accuracy: true
+
+model_cfg:
+  model: FreQait
+  num_parts: 8
+  dim: 128
+  efd:
+    num_harmonics: 32                # EFD files may store more (e.g. 128); the first 32 are used
+    num_coeffs: 4
+    attn_layers: 1
+    num_heads: 4
+    dropout: 0.1
+  skeleton:
+    mode: data                       # ablation: data (fixed edge graph [8,3,3]) | image (sigma Gaussian, SkeletonGait heatmap convention)
+    edge_sigma: 8.0                  # used only in image mode
+    canvas_height: 128.0             # used only in image mode (body height in px)
+    conf_thresh: 0.1                 # joints below this confidence are ignored for scale normalization
+    hidden_dim: 64
+    dropout: 0.1
+    # parts: COCO-17 + 17 neck + 18 mid-hip, 8 parts x 3 joints, same order as the EFD parts
+    parts:
+      - [15, 0, 16]   # full body
+      - [3, 0, 4]     # head
+      - [5, 18, 6]    # torso
+      - [5, 7, 9]     # left arm
+      - [6, 8, 10]    # right arm
+      - [11, 13, 15]  # left leg
+      - [12, 14, 16]  # right leg
+      - [11, 17, 12]  # dress
+  fusion:
+    squeeze_ratio: 4
+    dropout: 0.1
+  transformer:
+    out_dim: 128                     # C of [B, T, C] (= DTFPNet graph nodes)
+    num_layers: 2
+    num_heads: 4
+    dropout: 0.1
+  dtfpnet:
+    in_dim: 32
+    hidden_dim: 64
+    out_dim: 128
+    kern_size: [7, 5, 3]
+    kern_size_mid: [6, 5, 3]
+    groups: 2
+    GRU_layers: 1
+    dropout_size: [0.4, 0.5, 0.5]    # DTFPNet defaults
+    arch: dyGIN2d
+  head:
+    embed_dim: 256
+  # SeparateBNNecks:
+  #   class_num: 3000
+  # use_emb2: false
+
+optimizer_cfg:
+  solver: AdamW
+  lr: 0.001
+  weight_decay: 0.0001
+
+scheduler_cfg:
+  scheduler: MultiStepLR
+  gamma: 0.1
+  milestones:
+    - 30000
+    - 50000
+
+trainer_cfg:
+  enable_float16: true
+  fix_BN: false
+  find_unused_parameters: false      # every parameter (incl. DTFPNet graphs) is trained jointly
+  with_test: true
+  log_iter: 100
+  restore_ckpt_strict: true
+  restore_hint: 0
+  save_iter: 5000
+  save_name: FreQait
+  sync_BN: true
+  total_iter: 60000
+  sampler:
+    batch_shuffle: true
+    batch_size:
+      - 32 # identities per batch
+      - 4  # sequences per identity
+    frames_num_fixed: 30
+    frames_skip_num: 4
+    sample_type: fixed_ordered
+    type: TripletSampler
+  transform:
+    - type: NoOperation
+    - type: NoOperation
