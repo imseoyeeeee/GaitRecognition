@@ -1,7 +1,8 @@
 """
 Merge EFD and keypoint pickles into the OpenGait sequence layout used by FreQait.
 
-    EFD  (EFD-Analysis output) : <efd_root>/<ID>/<CAM>/<SEQ>.pkl         [T, 8, H, 4]
+    EFD                        : <efd_root>/<ID>/<CAM>/<SEQ>.pkl         [T, 8, H, 4]
+                                 (or <efd_root>/<ID>/<CAM>/<SEQ>/*.pkl)
     pose                       : <pose_root>/<ID>/<CAM>/<SEQ>/*.pkl      [T, 17, 3]
                                  (or <pose_root>/<ID>/<CAM>/<SEQ>.pkl)
     output                     : <out_root>/<ID>/<CAM>/<SEQ>/00-efd.pkl
@@ -55,8 +56,15 @@ def main():
     args = ap.parse_args()
 
     n_ok = n_trim = n_skip = 0
+    seen = set()
     for efd_file in sorted(args.efd_root.rglob('*.pkl')):
-        rel = efd_file.relative_to(args.efd_root).with_suffix('')          # ID/CAM/SEQ
+        # <ID>/<CAM>/<SEQ>.pkl  or  <ID>/<CAM>/<SEQ>/<name>.pkl  ->  ID/CAM/SEQ
+        rel = Path(*efd_file.relative_to(args.efd_root).with_suffix('').parts[:3])
+        if rel in seen:
+            print('[skip] more than one EFD pkl in', rel)
+            n_skip += 1
+            continue
+        seen.add(rel)
         pose_file = find_pose(args.pose_root, rel)
         if pose_file is None:
             print('[skip] no (unique) pose pkl for', rel)
