@@ -41,8 +41,9 @@ class DataSet(tordata.Dataset):
         return len(self.seqs_info)
 
     def __loader__(self, paths):
-        if not is_int_list(self.data_in_use):
+        if not is_int_list(self.data_in_use) and not self.multi_root:
             # When specified as a list of int, arbitrary order can be specified by the user
+            # (multi-root: the order is the order of dataset_root, so no sorting)
             paths = sorted(paths)
         data_list = []
         for pth in paths:
@@ -53,6 +54,13 @@ class DataSet(tordata.Dataset):
             else:
                 raise ValueError('- Loader - just support .pkl !!!')
             data_list.append(_)
+        if self.multi_root:
+            # modalities come from different folders: trim to the shortest sequence
+            lengths = [len(data) for data in data_list]
+            if max(lengths) - min(lengths) > self.max_len_diff:
+                get_msg_mgr().log_warning('Frame numbers differ by more than {} ({}): {}'.format(
+                    self.max_len_diff, lengths, paths))
+            data_list = [data[:min(lengths)] for data in data_list]
         for idx, data in enumerate(data_list):
             if len(data) != len(data_list[0]):
                 raise ValueError(
@@ -79,6 +87,10 @@ class DataSet(tordata.Dataset):
 
     def __dataset_parser(self, data_config, training):
         dataset_root = data_config['dataset_root']
+        # dataset_root may be a list: one folder per modality (e.g. [efd_root, pose_root]).
+        # Sequences are matched by <ID>/<CAM>/<SEQ>; data order = order of the list.
+        self.multi_root = isinstance(dataset_root, (list, tuple))
+        self.max_len_diff = data_config.get('max_len_diff', 5)
         try:
             self.data_in_use = data_config['data_in_use']  # [n], true or false or [m], index of data to use
         except:
@@ -88,7 +100,11 @@ class DataSet(tordata.Dataset):
             partition = json.load(f)
         train_set = partition["TRAIN_SET"]
         test_set = partition["TEST_SET"]
-        label_list = os.listdir(dataset_root)
+        if self.multi_root:
+            # only IDs present in every root
+            label_list = sorted(set.intersection(*[set(os.listdir(r)) for r in dataset_root]))
+        else:
+            label_list = os.listdir(dataset_root)
         train_set = [label for label in train_set if label in label_list]
         test_set = [label for label in test_set if label in label_list]
         miss_pids = [label for label in label_list if label not in (
@@ -135,5 +151,37 @@ class DataSet(tordata.Dataset):
                                 'Find no .pkl file in %s-%s-%s.' % (lab, typ, vie))
             return seqs_info_list
 
-        self.seqs_info = get_seqs_info_list(
-            train_set) if training else get_seqs_info_list(test_set)
+        def find_pkls(root, lab, typ, vie):
+            # <root>/<ID>/<CAM>/<SEQ>/*.pkl  or  <root>/<ID>/<CAM>/<SEQ>.pkl
+            seq_path = osp.join(root, lab, typ, vie)
+            if osp.isdir(seq_path):
+                return [osp.join(seq_path, f) for f in sorted(os.listdir(seq_path)) if f.endswith('.pkl')]
+            return [seq_path + '.pkl'] if osp.isfile(seq_path + '.pkl') else []
+
+        def get_seqs_info_list_multi(label_set):
+            seqs_info_list, n_missing = [], 0
+            first = dataset_root[0]
+            for lab in label_set:
+                for typ in sorted(os.listdir(osp.join(first, lab))):
+                    vies = sorted({v[:-4] if v.endswith('.pkl') else v
+                                   for v in os.listdir(osp.join(first, lab, typ))})
+                    for vie in vies:
+                        per_root = [find_pkls(root, lab, typ, vie) for root in dataset_root]
+                        if any(len(p) != 1 for p in per_root):
+                            n_missing += 1
+                            msg_mgr.log_debug('Need exactly one .pkl per root for %s-%s-%s, got %s.'
+                                              % (lab, typ, vie, [len(p) for p in per_root]))
+                            continue
+                        seq_dirs = [p[0] for p in per_root]
+                        if self.data_in_use is not None:
+                            if is_bool_list(self.data_in_use):
+                                seq_dirs = [d for d, use_bl in zip(seq_dirs, self.data_in_use) if use_bl]
+                            else:
+                                seq_dirs = [seq_dirs[idx] for idx in self.data_in_use if idx < len(seq_dirs)]
+                        seqs_info_list.append([lab, typ, vie, seq_dirs])
+            if n_missing > 0:
+                msg_mgr.log_warning('%d sequences skipped: not found in every dataset_root.' % n_missing)
+            return seqs_info_list
+
+        get_list = get_seqs_info_list_multi if self.multi_root else get_seqs_info_list
+        self.seqs_info = get_list(train_set) if training else get_list(test_set)

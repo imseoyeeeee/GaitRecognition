@@ -10,6 +10,7 @@ Frame-level pipeline (N = B*T frames, P = 8 parts):
   AttentionFusion (SkeletonGait++ style)          [N, P, D]
   PartTransformer (parts + CLS token)             [N, C]
 """
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -46,17 +47,27 @@ class EFDEncoder(nn.Module):
     """
     EFD [N, P, H_all, Co] -> [N, P, D]
 
-    1. keep the first `num_harmonics` harmonics
+    1. harmonic selection (`harmonics`):
+         int  n          -> the first n harmonics (index 0 .. n-1)
+         list of index   -> only these harmonics (0-based index along the stored H axis,
+                            index 0 = 1st harmonic), e.g. [0, 1, 2, 3, 5, 7, 11, 15]
     2. normalization: BatchNorm over every (harmonic, coefficient) pair, because
        EFD magnitudes decay quickly with the harmonic order
-    3. 1D CNN along the harmonic axis (shared by all parts) + harmonic / part embeddings
+    3. 1D CNN along the (selected) harmonic axis (shared by all parts) + harmonic / part embeddings
     4. harmonic self-attention + attention pooling over harmonics
     Parts whose contour is missing (all-zero EFD) are replaced by a learnable token.
     """
 
-    def __init__(self, num_parts=8, num_harmonics=32, num_coeffs=4, dim=128,
-                 attn_layers=1, num_heads=4, dropout=0.1):
+    def __init__(self, num_parts=8, harmonics=32, num_coeffs=4, dim=128,
+                 attn_layers=1, num_heads=4, dropout=0.1, num_harmonics=None):
         super().__init__()
+        if num_harmonics is not None:          # legacy key
+            harmonics = num_harmonics
+        index = list(range(harmonics)) if isinstance(harmonics, int) else [int(h) for h in harmonics]
+        assert len(index) > 0 and min(index) >= 0 and len(set(index)) == len(index), \
+            'efd.harmonics must be a positive int or a list of distinct non-negative indices'
+        num_harmonics = len(index)
+        self.register_buffer('harmonic_index', torch.tensor(index, dtype=torch.long), persistent=False)
         self.P, self.H, self.Co, self.D = num_parts, num_harmonics, num_coeffs, dim
 
         self.norm = nn.BatchNorm1d(num_harmonics * num_coeffs)
@@ -76,9 +87,11 @@ class EFDEncoder(nn.Module):
 
     def forward(self, efd):
         N, P, H_all, Co = efd.shape
-        assert P == self.P and Co == self.Co and H_all >= self.H, \
-            'EFD shape {} incompatible with (P={}, H={}, Co={})'.format(tuple(efd.shape), self.P, self.H, self.Co)
-        x = efd[:, :, :self.H].reshape(N * P, self.H, Co)
+        max_index = int(self.harmonic_index.max())
+        assert P == self.P and Co == self.Co and H_all > max_index, \
+            'EFD shape {} incompatible with (P={}, harmonic index up to {}, Co={})'.format(
+                tuple(efd.shape), self.P, max_index, self.Co)
+        x = efd.index_select(2, self.harmonic_index).reshape(N * P, self.H, Co)
         valid = x.abs().sum(dim=(1, 2)) > 0                               # [NP]
 
         x = self.norm(x.reshape(N * P, self.H * Co)).reshape(N * P, self.H, Co)
@@ -97,7 +110,8 @@ class EFDEncoder(nn.Module):
 # =============================================================================
 class SkeletonParser(nn.Module):
     """
-    Keypoint coordinates [N, 17, 3] (x, y, conf) -> parts [N, P, K, 3], edge graph [P, K, K], conf [N, P, K]
+    Keypoint coordinates [N, 17, 3] (x, y, conf)
+        -> normalized part coordinates [N, P, K, 2], part confidence [N, P, K], edge graph
 
     * adds virtual joints 17 = neck (mid-shoulder), 18 = mid-hip
     * center-normalization : subtract the mid-hip
@@ -108,11 +122,18 @@ class SkeletonParser(nn.Module):
         mode='image' : SkeletonGait heatmap convention - joints placed on a canvas where the body is
                        `canvas_height` px tall and a Gaussian kernel exp(-d^2 / 2 sigma^2) (sigma=8)
                        is added to the chain topology, re-normalized per frame          -> [N, P, K, K]
+    * augmentation (training only):
+        frame_drop_prob : a whole frame's detection is lost (all confidences -> 0)
+        joint_drop_prob : single joints are lost (confidence -> 0)
+        joint_noise_std : Gaussian noise on the normalized coordinates (unit = body height)
     No learnable parameters.
     """
 
-    def __init__(self, parts=None, conf_thresh=0.1, mode='data', edge_sigma=8.0, canvas_height=128.0):
+    def __init__(self, parts=None, conf_thresh=0.1, mode='data', edge_sigma=8.0, canvas_height=128.0,
+                 frame_drop_prob=0., joint_drop_prob=0., joint_noise_std=0.):
         super().__init__()
+        self.frame_drop_prob, self.joint_drop_prob = frame_drop_prob, joint_drop_prob
+        self.joint_noise_std = joint_noise_std
         parts = DEFAULT_PARTS if parts is None else parts
         K = len(parts[0])
         assert all(len(p) == K for p in parts), 'every part needs the same number of joints'
@@ -138,6 +159,11 @@ class SkeletonParser(nn.Module):
         N, J, _ = kpts.shape
         xy, conf = kpts[..., :2], kpts[..., 2].clamp(0, 1)
 
+        if self.training and self.frame_drop_prob > 0:
+            conf = conf * (torch.rand(N, 1, device=conf.device) >= self.frame_drop_prob).to(conf.dtype)
+        if self.training and self.joint_drop_prob > 0:
+            conf = conf * (torch.rand(N, J, device=conf.device) >= self.joint_drop_prob).to(conf.dtype)
+
         # virtual joints
         neck = (xy[:, 5] + xy[:, 6]) / 2
         midhip = (xy[:, 11] + xy[:, 12]) / 2
@@ -157,21 +183,45 @@ class SkeletonParser(nn.Module):
         height = y_max - y_min
         height = torch.where((mask.sum(1) >= 2) & (height > 1e-6), height, torch.ones_like(height))
         xy = xy / height.view(N, 1, 1)
+        if self.training and self.joint_noise_std > 0:
+            xy = xy + torch.randn_like(xy) * self.joint_noise_std
 
         # parsing [N, 19, .] -> [N, P, K, .]
         flat = self.part_index.view(-1)
         p_xy = xy[:, flat].view(N, self.P, self.K, 2)
         p_conf = conf[:, flat].view(N, self.P, self.K)
-        parts = torch.cat([p_xy * p_conf.unsqueeze(-1), p_conf.unsqueeze(-1)], -1)   # [N, P, K, 3]
 
         if self.mode == 'data':
-            return parts, self.edge_graph, p_conf
+            return p_xy, p_conf, self.edge_graph
         # mode == 'image': Gaussian kernel on the heatmap canvas
         d = torch.cdist(p_xy.float(), p_xy.float()) * self.canvas_height           # [N, P, K, K] (px)
         gauss = torch.exp(-d.pow(2) / (2 * self.edge_sigma ** 2))
         off_diag = 1. - torch.eye(self.K, device=kpts.device)
         A = self.topology.unsqueeze(0) + gauss * off_diag
-        return parts, self._sym_norm(A).to(kpts.dtype), p_conf
+        return p_xy, p_conf, self._sym_norm(A).to(kpts.dtype)
+
+
+def joint_features(p_xy, p_conf, n, s, seqL=None, use_velocity=True):
+    """
+    Per-joint input features for the GCN.
+        position : (x * c, y * c, c)                                   -> 3 channels
+        velocity : (x_t - x_{t-1}, y_t - y_{t-1}) * min(c_t, c_{t-1})   -> +2 channels
+    p_xy [n*s, P, K, 2], p_conf [n*s, P, K]; frames are ordered as n sequences of s frames
+    (training) or one concatenation of len(seqL) sequences (test, n = 1).
+    The first frame of every sequence gets zero velocity.
+    """
+    c = p_conf.unsqueeze(-1).to(p_xy.dtype)
+    feats = [p_xy * c, c]
+    if use_velocity:
+        xy = p_xy.view(n, s, *p_xy.shape[1:])
+        cf = c.view(n, s, *c.shape[1:])
+        vel = torch.zeros_like(xy)
+        vel[:, 1:] = (xy[:, 1:] - xy[:, :-1]) * torch.min(cf[:, 1:], cf[:, :-1])
+        if seqL is not None:                     # no velocity across sequence boundaries
+            starts = torch.cumsum(seqL[0].long(), 0)[:-1]
+            vel[:, starts] = 0
+        feats.append(vel.view_as(p_xy))
+    return torch.cat(feats, -1)
 
 
 class PartGraphConv(nn.Module):
@@ -250,6 +300,26 @@ class AttentionFusion(nn.Module):
         return efd_feat * w[:, :, 0] + skel_feat * w[:, :, 1]
 
 
+class PartwiseProjection(nn.Module):
+    """
+    [N, P, D] -> [N, C]  (recommended part aggregation, light)
+    Every part gets its own Linear(D -> C/P); the outputs are concatenated, so each
+    channel group of the frame feature belongs to one part. Inter-part coordination is
+    left to the temporal module (DTFPNet's node graph runs over these channels).
+    """
+
+    def __init__(self, num_parts=8, dim=128, out_dim=128):
+        super().__init__()
+        assert out_dim % num_parts == 0, 'out_dim must be divisible by num_parts'
+        self.weight = nn.Parameter(nn.init.xavier_uniform_(torch.empty(num_parts, dim, out_dim // num_parts)))
+        self.bias = nn.Parameter(torch.zeros(num_parts, out_dim // num_parts))
+        self.norm = nn.LayerNorm(out_dim)
+
+    def forward(self, x):
+        x = torch.einsum('npd,pdc->npc', x, self.weight.to(x.dtype)) + self.bias.to(x.dtype)
+        return self.norm(x.reshape(x.size(0), -1))
+
+
 class PartTransformer(nn.Module):
     """[N, P, D] part tokens + CLS -> transformer encoder -> CLS projected to [N, C]"""
 
@@ -266,3 +336,105 @@ class PartTransformer(nn.Module):
         x = torch.cat([self.cls_token.expand(N, -1, -1).to(x.dtype), x], 1) + self.pos_embedding
         x = self.blocks(x)
         return self.proj(self.norm(x[:, 0]))
+
+
+# =============================================================================
+# Temporal transformer (ablation alternative to DTFPNet)
+# =============================================================================
+class TemporalTransformer(nn.Module):
+    """
+    Frame features [n, C, s] -> sequence embedding [n, out_dim, 1]  (same interface as DTFPNet)
+
+    Linear(C -> dim) + sinusoidal position encoding -> pre-norm transformer blocks over frames ->
+    LayerNorm -> mean over time -> Linear(dim -> out_dim).
+    Variable-length test sequences (seqL) are processed one by one, like DTFPNet.
+
+    Train / test length gap: training clips have `clip_len` frames (= frames_num_fixed), while test
+    sequences use all frames. In eval mode, a sequence longer than `clip_len` is cut into windows of
+    `clip_len` frames (step `clip_stride`, the last window aligned to the end); every window is
+    embedded on its own and the embeddings are averaged, so the model only sees positions it was
+    trained on. `clip_len: null` disables this (whole sequence at once).
+    """
+
+    def __init__(self, num_nodes=128, dim=128, out_dim=128, num_layers=2, num_heads=4, dropout=0.1,
+                 clip_len=30, clip_stride=15, num_parts=None):
+        super().__init__()
+        if num_parts:
+            raise ValueError("head.type 'part' is not supported with temporal.type 'transformer': its tokens "
+                             "are whole frames, so there is no part axis left. Use head.type: global.")
+        self.dim, self.out_dim = dim, out_dim
+        self.clip_len, self.clip_stride = clip_len, clip_stride
+        self.in_proj = nn.Linear(num_nodes, dim)
+        self.blocks = nn.Sequential(*[TransformerBlock(dim, num_heads, dropout) for _ in range(num_layers)])
+        self.norm = nn.LayerNorm(dim)
+        self.out_proj = nn.Linear(dim, out_dim)
+
+    def positional_encoding(self, length, device, dtype):
+        pos = torch.arange(length, device=device, dtype=torch.float32).unsqueeze(1)
+        div = torch.exp(torch.arange(0, self.dim, 2, device=device, dtype=torch.float32)
+                        * (-math.log(10000.0) / self.dim))
+        pe = torch.zeros(length, self.dim, device=device)
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        return pe.to(dtype).unsqueeze(0)
+
+    def _forward_batch(self, x):
+        x = self.in_proj(x.transpose(1, 2))                      # [n, s, dim]
+        x = x + self.positional_encoding(x.size(1), x.device, x.dtype)
+        x = self.norm(self.blocks(x)).mean(1)                    # [n, dim]
+        return self.out_proj(x).unsqueeze(-1)                   # [n, out_dim, 1]
+
+    def _forward_clips(self, x):
+        """eval only: x [n, C, L] -> mean of window embeddings [n, out_dim, 1]"""
+        n, C, L = x.shape
+        if self.training or not self.clip_len or L <= self.clip_len:
+            return self._forward_batch(x)
+        starts = list(range(0, L - self.clip_len + 1, self.clip_stride))
+        if starts[-1] != L - self.clip_len:
+            starts.append(L - self.clip_len)                    # cover the tail
+        clips = torch.stack([x[:, :, s:s + self.clip_len] for s in starts], 1)   # [n, k, C, clip]
+        emb = self._forward_batch(clips.reshape(n * len(starts), C, self.clip_len))
+        return emb.view(n, len(starts), *emb.shape[1:]).mean(1)
+
+    def forward(self, x, seqL=None):
+        if seqL is None:
+            return self._forward_clips(x)
+        outs, start = [], 0
+        for L in seqL[0].data.cpu().numpy().tolist():
+            outs.append(self._forward_clips(x[:, :, start:start + L]))
+            start += L
+        return torch.cat(outs, 0)
+
+
+# =============================================================================
+# Set pooling (GaitSet-style temporal baseline)
+# =============================================================================
+class SetPooling(nn.Module):
+    """
+    Frame features [n, C, s] -> max over frames (order-free, length-agnostic).
+        global : [n, C, 1]
+        parts  : channels grouped by part (PartwiseProjection order) -> [n, C / P, P]
+    No learnable parameters; the head FCs map it to the embedding.
+    """
+
+    def __init__(self, num_nodes=64, num_parts=None):
+        super().__init__()
+        if num_parts:
+            assert num_nodes % num_parts == 0, 'num_nodes must be divisible by num_parts'
+        self.num_parts = num_parts
+        self.out_dim = num_nodes // num_parts if num_parts else num_nodes
+
+    def _pool(self, x):
+        x = x.max(-1)[0]                                              # [n, C]
+        if self.num_parts:
+            return x.view(x.size(0), self.num_parts, -1).transpose(1, 2).contiguous()   # [n, C/P, P]
+        return x.unsqueeze(-1)
+
+    def forward(self, x, seqL=None):
+        if seqL is None:
+            return self._pool(x)
+        outs, start = [], 0
+        for L in seqL[0].data.cpu().numpy().tolist():
+            outs.append(self._pool(x[:, :, start:start + L]))
+            start += L
+        return torch.cat(outs, 0)

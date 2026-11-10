@@ -122,12 +122,17 @@ class DTFPNet(nn.Module):
 
     def __init__(self, num_nodes=128, in_dim=32, hidden_dim=64, out_dim=128,
                  kern_size=(7, 5, 3), kern_size_mid=(6, 5, 3), groups=2, GRU_layers=1,
-                 dropout_size=(0.4, 0.5, 0.5), arch='dyGIN2d'):
+                 dropout_size=(0.4, 0.5, 0.5), arch='dyGIN2d', num_parts=None):
         super().__init__()
         assert len(kern_size) == 3 and len(kern_size_mid) == 3 and len(dropout_size) == 3
         self.num_nodes = num_nodes
         self.num_graphs = groups
         self.out_dim = out_dim
+        # part output: the graph nodes (= input channels) are grouped by part, in order
+        # (PartwiseProjection concatenates parts), so node groups give part embeddings
+        if num_parts:
+            assert num_nodes % num_parts == 0, 'num_nodes must be divisible by num_parts'
+        self.num_parts = num_parts
 
         k_neighs = num_nodes
         self.g_constr = LearnableGraph(num_nodes, k_neighs, self.num_graphs)
@@ -198,14 +203,17 @@ class DTFPNet(nn.Module):
         x_3 = self.gconvs_3(x_3, adj)
         x_out = F.dropout(x_3, p=self.dropout_3, training=self.training)
 
-        return self.global_pool(x_out).view(B, -1)  # [B, out_dim]
+        if self.num_parts:
+            x_out = x_out.mean(-1)                                           # time  -> [B, out_dim, N]
+            return x_out.view(B, self.out_dim, self.num_parts, -1).mean(-1)  # nodes -> [B, out_dim, P]
+        return self.global_pool(x_out).view(B, -1, 1)                        # [B, out_dim, 1]
 
     def forward(self, x, seqL=None):
         """
         x:    [n, C, s]  frame features along time
         seqL: None (fixed-length training batch) or [1, k] lengths of k sequences
               concatenated along s (OpenGait test-time collate).
-        out:  [n or k, out_dim]
+        out:  [n or k, out_dim, bins]  (bins = 1, or num_parts)
         """
         if seqL is None:
             return self._forward_batch(x)
