@@ -77,14 +77,22 @@ model_cfg:
     use_velocity: true               # ablation: add joint velocity (frame difference) to the GCN input (3 -> 5 channels)
     edge_sigma: 8.0                  # used only in image mode
     canvas_height: 128.0             # used only in image mode (body height in px)
+    edge_conf: false                 # image mode only: multiply the Gaussian edge weight by conf_i * conf_j
+    edge_alpha: 1.0                  # image mode only: A = topology + alpha * Gaussian (initial value if learned)
+    learn_alpha: true                # image mode only: learn alpha per part (softplus); false: fixed edge_alpha
     conf_thresh: 0.1                 # joints below this confidence are ignored for scale normalization
+    virtual_require_both: true       # virtual joints (17 neck, 18 mid-hip): conf = mean of the two source joints;
+                                     #   true: 0 if either source joint is below conf_thresh
     hidden_dim: 64
     dropout: 0.1
-    # parts: COCO-17 + 17 neck + 18 mid-hip, 8 parts x 3 joints, same order as the EFD parts
+    # parts: COCO-17 + 17 neck + 18 mid-hip, same order as the EFD parts. Parts may differ in size.
+    #   [a, b, c]                         : chain topology (a-b, b-c)
+    #   {joints: all | [...], topology: skeleton | chain} : skeleton = human bones between the listed joints
+    #   {joints: [...], edges: [[u, v], ...]}            : explicit edges (joint ids)
     parts:
-      - [15, 0, 16]   # full body
-      - [3, 0, 4]     # head
-      - [5, 18, 6]    # torso
+      - {joints: all, topology: skeleton}   # full body: all 19 joints   (previous setting: [15, 0, 16])
+      - {joints: [0, 1, 2, 3, 4], topology: skeleton}      # head: nose-eyes-ears   (previous: [3, 0, 4])
+      - {joints: [5, 6, 11, 12], edges: [[5, 6], [6, 12], [12, 11], [11, 5]]}   # torso: shoulders-hips rectangle (previous: [5, 18, 6])
       - [5, 7, 9]     # left arm
       - [6, 8, 10]    # right arm
       - [11, 13, 15]  # left leg
@@ -95,6 +103,9 @@ model_cfg:
     joint_drop_prob: 0.05            # skeleton: single joints are lost
     joint_noise_std: 0.01            # skeleton: Gaussian noise on normalized coordinates (unit = body height)
     modality_drop_prob: 0.1          # per sequence: EFD or skeleton features are zeroed (each p/2)
+    harmonic_drop_prob: 0.1          # EFD: each harmonic is switched off (normalized coefficients -> 0)
+    harmonic_drop_scope: sequence    # sequence: same harmonics off in every frame (per part) | frame: per frame
+    harmonic_drop_keep_first: true   # never drop the 1st harmonic (base ellipse of the part)
   fusion:
     squeeze_ratio: 4
     dropout: 0.1
@@ -155,7 +166,8 @@ trainer_cfg:
   log_iter: 100
   restore_ckpt_strict: true
   restore_hint: 0
-  save_iter: 5000
+  save_iter: 5000                    # checkpoint (+ parameter count in the log)
+  eval_iter: 1000                    # test + result summary (needs with_test: true); default = save_iter
   save_name: FreQait
   sync_BN: true
   total_iter: 60000

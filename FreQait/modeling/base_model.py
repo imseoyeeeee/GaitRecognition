@@ -243,8 +243,15 @@ class BaseModel(MetaModel, nn.Module):
                 'optimizer': self.optimizer.state_dict(),
                 'scheduler': self.scheduler.state_dict(),
                 'iteration': iteration}
-            torch.save(checkpoint,
-                       osp.join(self.save_path, 'checkpoints/{}-{:0>5}.pt'.format(save_name, iteration)))
+            save_file = osp.join(self.save_path, 'checkpoints/{}-{:0>5}.pt'.format(save_name, iteration))
+            torch.save(checkpoint, save_file)
+            n_all = sum(p.numel() for p in self.parameters())
+            # the CE classifier of the BNNeck (fc_bin) is used for training only
+            n_cls = sum(p.numel() for n, p in self.named_parameters() if 'BNNecks.fc_bin' in n)
+            msg = 'Checkpoint saved: {} | Parameters: {:.3f}M'.format(save_file, n_all / 1e6)
+            if n_cls:
+                msg += ' ({:.3f}M without the training-only CE classifier)'.format((n_all - n_cls) / 1e6)
+            self.msg_mgr.log_info(msg)
 
     def _load_ckpt(self, save_name):
         load_ckpt_strict = self.engine_cfg['restore_ckpt_strict']
@@ -421,7 +428,8 @@ class BaseModel(MetaModel, nn.Module):
                 # save the checkpoint
                 model.save_ckpt(model.iteration)
 
-                # run test if with_test = true
+            # run test (+ result summary) every eval_iter iterations if with_test = true (default: save_iter)
+            if model.iteration % model.engine_cfg.get('eval_iter', model.engine_cfg['save_iter']) == 0:
                 if model.engine_cfg['with_test']:
                     model.msg_mgr.log_info("Running test...")
                     model.eval()
@@ -465,4 +473,25 @@ class BaseModel(MetaModel, nn.Module):
                 dataset_name = model.cfgs['data_cfg']['test_dataset_name']
             except:
                 dataset_name = model.cfgs['data_cfg']['dataset_name']
-            return eval_func(info_dict, dataset_name, **valid_args)
+            results = eval_func(info_dict, dataset_name, **valid_args)
+            info = {k: results.pop(k) for k in list(results) if k.startswith('info/')}
+            BaseModel.log_result_summary(model, dataset_name, results, info)
+            return results
+
+    @staticmethod
+    def log_result_summary(model, dataset_name, results, info):
+        """Result summary: number of probes / gallery, Top-1 / Top-5 accuracy (= Rank-1 / Rank-5), mAP.
+        (The parameter count is logged when a checkpoint is saved.)"""
+        lines = ['=' * 22 + ' Result summary ({}, iteration {}) '.format(dataset_name, model.iteration) + '=' * 22]
+        if 'info/num_probe' in info:
+            probe = 'Probe set     : {} sequences'.format(info['info/num_probe'])
+            if info.get('info/num_valid_probe', info['info/num_probe']) != info['info/num_probe']:
+                probe += ' ({} with the same ID in the gallery)'.format(info['info/num_valid_probe'])
+            lines.append(probe)
+            lines.append('Gallery set   : {} sequences'.format(info['info/num_gallery']))
+        for name, key in [('Top-1 accuracy', 'Rank-1'), ('Top-5 accuracy', 'Rank-5'), ('mAP', 'mAP')]:
+            v = results.get('scalar/test_accuracy/' + key)
+            if v is not None:
+                lines.append('{:<14}: {:.2f}%'.format(name, float(v)))
+        lines.append('=' * len(lines[0]))
+        model.msg_mgr.log_info('\n' + '\n'.join(lines))

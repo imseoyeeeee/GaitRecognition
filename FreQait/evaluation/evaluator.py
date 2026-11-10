@@ -618,4 +618,8 @@ def evaluate_probe_gallery(data, dataset, metric='euc', probe_gallery=None):
         for v, g in groups.items():
             results['scalar/test_accuracy/Rank-1@view-{}'.format(v)] = g[0][0] * 100
     msg_mgr.log_info(results)
+    # counts for the final summary (removed by BaseModel.run_test, not written to tensorboard)
+    results['info/num_probe'] = len(p_y)
+    results['info/num_valid_probe'] = len(all_ap)
+    results['info/num_gallery'] = len(g_y)
     return results

@@ -19,7 +19,7 @@ class FreQait(BaseModel):
 
     Step 1 (spatial, per frame)
         EFD  -> harmonic selection -> 1D CNN -> harmonic attention                 [n, s, 8, D]
-        pose -> normalize -> parse [8, 3, 3] -> (pos [+ velocity]) -> GCN -> joint attention pool [n, s, 8, D]
+        pose -> normalize -> parse 8 parts (V joint nodes) -> (pos [+ velocity]) -> GCN -> joint attention pool [n, s, 8, D]
     Step 2 (fusion)
         [modality dropout] -> SkeletonGait++ attention fusion                      [n, s, 8, D]
         part aggregation -> [n, s, C]            (part_aggregation.type: partwise | transformer)
@@ -41,16 +41,24 @@ class FreQait(BaseModel):
         head_cfg = model_cfg.get('head', {})
 
         # ---------------- Step 1 - spatial ----------------
-        self.efd_encoder = EFDEncoder(num_parts=P, dim=D, **efd_cfg)
+        self.efd_encoder = EFDEncoder(
+            num_parts=P, dim=D, harmonic_drop_prob=aug_cfg.get('harmonic_drop_prob', 0.),
+            harmonic_drop_scope=aug_cfg.get('harmonic_drop_scope', 'sequence'),
+            harmonic_drop_keep_first=aug_cfg.get('harmonic_drop_keep_first', True), **efd_cfg)
         self.skeleton_parser = SkeletonParser(
             parts=skl_cfg.get('parts'), conf_thresh=skl_cfg.get('conf_thresh', 0.1),
             mode=skl_cfg.get('mode', 'data'), edge_sigma=skl_cfg.get('edge_sigma', 8.0),
-            canvas_height=skl_cfg.get('canvas_height', 128.0),
+            canvas_height=skl_cfg.get('canvas_height', 128.0), edge_conf=skl_cfg.get('edge_conf', False),
+            edge_alpha=skl_cfg.get('edge_alpha', 1.0), learn_alpha=skl_cfg.get('learn_alpha', False),
+            virtual_require_both=skl_cfg.get('virtual_require_both', True),
             frame_drop_prob=aug_cfg.get('frame_drop_prob', 0.), joint_drop_prob=aug_cfg.get('joint_drop_prob', 0.),
             joint_noise_std=aug_cfg.get('joint_noise_std', 0.))
+        if self.skeleton_parser.P != P:
+            raise ValueError('model_cfg.skeleton.parts has {} parts but num_parts is {}; give one joint group '
+                             'per EFD part, in the same order'.format(self.skeleton_parser.P, P))
         self.use_velocity = skl_cfg.get('use_velocity', False)
         self.skeleton_encoder = PartGCNEncoder(
-            num_parts=P, num_joints=self.skeleton_parser.K, in_channels=5 if self.use_velocity else 3,
+            part_of_node=self.skeleton_parser.part_of_node.tolist(), in_channels=5 if self.use_velocity else 3,
             hidden_dim=skl_cfg.get('hidden_dim', 64), dim=D, dropout=skl_cfg.get('dropout', 0.1))
 
         # ---------------- Step 2 - fusion ----------------
@@ -129,13 +137,18 @@ class FreQait(BaseModel):
         return agg_cfg, tmp_cfg
 
     def load_state_dict(self, state_dict, strict=True):
-        """Accept checkpoints of the old layout (`transformer.*` part transformer, GIN `mlp` weights)."""
+        """Accept checkpoints of the old layouts (`transformer.*` part transformer, GIN `mlp` weights,
+        fixed-size parts: joint embedding [P, K, D] and stored skeleton graph buffers)."""
         new_sd = type(state_dict)()
         for k, v in state_dict.items():
             if k.startswith('transformer.'):
                 k = 'part_aggregation.' + k[len('transformer.'):]
             if k.startswith('temporal.gconvs_') and '.mlp.' in k:
                 continue  # unused GIN mlp of the original DTFPNet layer
+            if k.startswith('skeleton_parser.') and k.split('.')[-1] in ('part_index', 'topology', 'edge_graph'):
+                continue  # graph buffers are rebuilt from the config
+            if k == 'skeleton_encoder.joint_embedding' and v.dim() == 3:
+                v = v.reshape(-1, v.shape[-1])  # [P, K, D] -> [V, D]
             new_sd[k] = v
         return super().load_state_dict(new_sd, strict=strict)
 
@@ -161,9 +174,9 @@ class FreQait(BaseModel):
         assert pose.shape[:2] == (n, s), 'EFD and keypoint sequences must have the same length'
 
         # ---------- Step 1: spatial (frame level) ----------
-        efd_feat = self.efd_encoder(efd.reshape(n * s, *efd.shape[2:]))           # [ns, P, D]
+        efd_feat = self.efd_encoder(efd.reshape(n * s, *efd.shape[2:]), n)        # [ns, P, D]
         p_xy, p_conf, graph = self.skeleton_parser(pose.reshape(n * s, *pose.shape[2:]))
-        feats = joint_features(p_xy, p_conf, n, s, seqL, self.use_velocity)      # [ns, P, K, 3 or 5]
+        feats = joint_features(p_xy, p_conf, n, s, seqL, self.use_velocity)      # [ns, V, 3 or 5]
         skl_feat = self.skeleton_encoder(feats, graph, p_conf)                    # [ns, P, D]
 
         # ---------- Step 2: fusion + part aggregation ----------
@@ -185,8 +198,12 @@ class FreQait(BaseModel):
             if self.inference_use_emb2:
                 embed = embed_2
 
+        visual_summary = {}
+        if self.training and self.skeleton_parser.learn_alpha:      # tensorboard: scalar/skeleton_alpha/part<i>
+            for i, a in enumerate(self.skeleton_parser.alpha().detach()):
+                visual_summary['scalar/skeleton_alpha/part{}'.format(i)] = a
         return {
             'training_feat': training_feat,
-            'visual_summary': {},
+            'visual_summary': visual_summary,
             'inference_feat': {'embeddings': embed},
         }

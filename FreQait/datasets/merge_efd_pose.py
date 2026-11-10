@@ -21,9 +21,21 @@ from pathlib import Path
 import numpy as np
 
 
+class _NumpyCompatUnpickler(pickle.Unpickler):
+    """Read .pkl files written with numpy >= 2 (`numpy._core`) under numpy 1.x (`numpy.core`)."""
+
+    def find_class(self, module, name):
+        if module.startswith('numpy._core'):
+            try:
+                __import__(module)
+            except ModuleNotFoundError:
+                module = 'numpy.core' + module[len('numpy._core'):]
+        return super().find_class(module, name)
+
+
 def load(path):
     with open(path, 'rb') as f:
-        return np.asarray(pickle.load(f))
+        return np.asarray(_NumpyCompatUnpickler(f).load())
 
 
 def find_pose(pose_root, rel):

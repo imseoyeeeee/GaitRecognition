@@ -4,7 +4,7 @@ import argparse
 import torch
 import torch.nn as nn
 from modeling import models
-from utils import config_loader, get_ddp_module, init_seeds, params_count, get_msg_mgr
+from utils import config_loader, get_ddp_module, init_seeds, get_msg_mgr
 
 parser = argparse.ArgumentParser(description='Main program for FreQait.')
 parser.add_argument('--local_rank', type=int, default=0,
@@ -52,7 +52,6 @@ def run_model(cfgs, training):
     if cfgs['trainer_cfg']['fix_BN']:
         model.fix_BN()
     model = get_ddp_module(model, cfgs['trainer_cfg']['find_unused_parameters'])
-    msg_mgr.log_info(params_count(model))
     msg_mgr.log_info("Model Initialization Finished!")
 
     if training:

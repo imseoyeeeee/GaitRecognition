@@ -8,6 +8,24 @@ from utils import get_msg_mgr, is_bool_list, is_int_list
 import torch
 from pathlib import Path
 
+
+class _NumpyCompatUnpickler(pickle.Unpickler):
+    """Read .pkl files written with numpy >= 2 (module `numpy._core`) under numpy 1.x (`numpy.core`)."""
+
+    def find_class(self, module, name):
+        if module.startswith('numpy._core'):
+            try:
+                __import__(module)
+            except ModuleNotFoundError:
+                module = 'numpy.core' + module[len('numpy._core'):]
+        return super().find_class(module, name)
+
+
+def load_pkl(path):
+    with open(path, 'rb') as f:
+        return _NumpyCompatUnpickler(f).load()
+
+
 class DataSet(tordata.Dataset):
     def __init__(self, data_cfg, training):
         """
@@ -48,9 +66,7 @@ class DataSet(tordata.Dataset):
         data_list = []
         for pth in paths:
             if pth.endswith('.pkl'):
-                with open(pth, 'rb') as f:
-                    _ = pickle.load(f)
-                f.close()
+                _ = load_pkl(pth)
             else:
                 raise ValueError('- Loader - just support .pkl !!!')
             data_list.append(_)

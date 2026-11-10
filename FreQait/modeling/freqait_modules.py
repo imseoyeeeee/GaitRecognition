@@ -4,9 +4,9 @@ Building blocks of FreQait (see configs/freqait/*.yaml for hyper-parameters).
 Frame-level pipeline (N = B*T frames, P = 8 parts):
 
   EFD      [N, P, H, Co] --EFDEncoder-----------> [N, P, D]   (1D CNN + harmonic attention)
-  Keypoint [N, 17, 3]    --SkeletonParser-------> parts [N, P, K, 3], edge graph [P, K, K] ('data')
-                                                   or [N, P, K, K] ('image', sigma=8 Gaussian)
-                         --PartGCNEncoder-------> [N, P, K, D] -> joint attention pool -> [N, P, D]
+  Keypoint [N, 17, 3]    --SkeletonParser-------> joint nodes of all parts [N, V, 3], block-diagonal
+                                                   graph [V, V] ('data') or [N, V, V] ('image', sigma=8)
+                         --PartGCNEncoder-------> [N, V, D] -> joint attention pool per part -> [N, P, D]
   AttentionFusion (SkeletonGait++ style)          [N, P, D]
   PartTransformer (parts + CLS token)             [N, C]
 """
@@ -26,8 +26,11 @@ TransformerBlock = HarmonicSelfAttention
 #   [full_body(background), head, torso, left_arm, right_arm, left_leg, right_leg, dress]
 # COCO-17: 0 nose, 1/2 eyes, 3/4 ears, 5/6 shoulders, 7/8 elbows, 9/10 wrists,
 #          11/12 hips, 13/14 knees, 15/16 ankles.   Virtual: 17 neck, 18 mid-hip.
-# Each part is an ordered chain: consecutive joints are connected.
+# A part is either a list of joints (ordered chain: consecutive joints are connected)
+# or a dict {joints: [...] | all, topology: chain | skeleton} or {joints: [...], edges: [[u, v], ...]}
+# (explicit edges, joint ids); parts may have different sizes.
 # ---------------------------------------------------------------------------
+NUM_JOINTS = 19
 DEFAULT_PARTS = [
     [15, 0, 16],   # full body : L-ankle - nose - R-ankle
     [3, 0, 4],     # head      : L-ear - nose - R-ear
@@ -37,6 +40,14 @@ DEFAULT_PARTS = [
     [11, 13, 15],  # left leg
     [12, 14, 16],  # right leg
     [11, 17, 12],  # dress     : L-hip - neck - R-hip
+]
+# human skeleton bones of the 19 joints (a tree), used by `topology: skeleton`
+SKELETON_EDGES = [
+    (0, 1), (0, 2), (1, 3), (2, 4),             # face
+    (0, 17), (17, 5), (17, 6),                  # nose - neck - shoulders
+    (5, 7), (7, 9), (6, 8), (8, 10),            # arms
+    (17, 18), (18, 11), (18, 12),               # spine, mid-hip - hips
+    (11, 13), (13, 15), (12, 14), (14, 16),     # legs
 ]
 
 
@@ -55,12 +66,26 @@ class EFDEncoder(nn.Module):
        EFD magnitudes decay quickly with the harmonic order
     3. 1D CNN along the (selected) harmonic axis (shared by all parts) + harmonic / part embeddings
     4. harmonic self-attention + attention pooling over harmonics
-    Parts whose contour is missing (all-zero EFD) are replaced by a learnable token.
+    Parts whose contour is missing (all-zero EFD) are replaced by a learnable token. "Missing" is
+    one fixed vector per part, so the appearance / disappearance of a part over time stays a
+    pattern for the temporal model.
+
+    Harmonic dropout (training only, augmentation): every selected harmonic is switched off
+    with probability `harmonic_drop_prob` by zeroing its normalized coefficients (0 = the mean
+    after BatchNorm, i.e. no information). scope 'sequence': the same harmonics are dropped in
+    every frame of a sequence (per part), 'frame': independently per frame. keep_first: never
+    drop the 1st selected harmonic (the base ellipse: size / orientation of the part).
     """
 
     def __init__(self, num_parts=8, harmonics=32, num_coeffs=4, dim=128,
-                 attn_layers=1, num_heads=4, dropout=0.1, num_harmonics=None):
+                 attn_layers=1, num_heads=4, dropout=0.1, num_harmonics=None,
+                 harmonic_drop_prob=0., harmonic_drop_scope='sequence', harmonic_drop_keep_first=True):
         super().__init__()
+        assert 0. <= harmonic_drop_prob < 1., 'harmonic_drop_prob must be in [0, 1)'
+        assert harmonic_drop_scope in ('sequence', 'frame'), "harmonic_drop_scope must be 'sequence' or 'frame'"
+        self.harmonic_drop_prob = harmonic_drop_prob
+        self.harmonic_drop_scope = harmonic_drop_scope
+        self.harmonic_drop_keep_first = harmonic_drop_keep_first
         if num_harmonics is not None:          # legacy key
             harmonics = num_harmonics
         index = list(range(harmonics)) if isinstance(harmonics, int) else [int(h) for h in harmonics]
@@ -85,16 +110,37 @@ class EFDEncoder(nn.Module):
         self.pooling = HarmonicAttentionPooling(dim)
         self.missing_token = nn.Parameter(torch.zeros(num_parts, dim))
 
-    def forward(self, efd):
+    def harmonic_dropout(self, x, n):
+        """x [N*P, H, Co] (normalized), N = n sequences x s frames -> harmonics zeroed at random."""
+        if not self.training or self.harmonic_drop_prob <= 0:
+            return x
+        NP = x.shape[0]
+        if self.harmonic_drop_scope == 'sequence' and n is not None:
+            s = NP // (n * self.P)
+            keep = torch.rand(n, 1, self.P, self.H, device=x.device) >= self.harmonic_drop_prob
+            keep = keep.expand(n, s, self.P, self.H).reshape(NP, self.H)
+        else:
+            keep = torch.rand(NP, self.H, device=x.device) >= self.harmonic_drop_prob
+        if self.harmonic_drop_keep_first:
+            keep[:, 0] = True
+        return x * keep.unsqueeze(-1).to(x.dtype)
+
+    def forward(self, efd, n=None):
+        """efd [N, P, H_all, Co]; n = number of sequences in N (for sequence-level harmonic dropout)."""
         N, P, H_all, Co = efd.shape
         max_index = int(self.harmonic_index.max())
-        assert P == self.P and Co == self.Co and H_all > max_index, \
+        assert P == self.P, \
+            'EFD data has {} parts but model_cfg.num_parts is {}. Set num_parts: {} and give skeleton.parts ' \
+            '{} joint groups in the same order as the EFD parts (fineefd: 8 parts, coarseefd: 4).'.format(
+                P, self.P, P, P)
+        assert Co == self.Co and H_all > max_index, \
             'EFD shape {} incompatible with (P={}, harmonic index up to {}, Co={})'.format(
                 tuple(efd.shape), self.P, max_index, self.Co)
         x = efd.index_select(2, self.harmonic_index).reshape(N * P, self.H, Co)
         valid = x.abs().sum(dim=(1, 2)) > 0                               # [NP]
 
         x = self.norm(x.reshape(N * P, self.H * Co)).reshape(N * P, self.H, Co)
+        x = self.harmonic_dropout(x, n)
         x = self.cnn(x.transpose(1, 2)).transpose(1, 2)                    # [NP, H, D]
         x = x + self.harmonic_embedding
         x = (x.view(N, P, self.H, self.D) + self.part_embedding).view(N * P, self.H, self.D)
@@ -108,47 +154,113 @@ class EFDEncoder(nn.Module):
 # =============================================================================
 # Skeleton branch
 # =============================================================================
+def parse_part_cfg(parts):
+    """-> list of (joints, edges) with edges as (a, b) positions inside the part."""
+    out = []
+    for i, part in enumerate(parts):
+        if isinstance(part, dict):
+            joints = part.get('joints', 'all')
+            topology = part.get('topology', 'chain')
+            explicit = part.get('edges')
+        else:
+            joints, topology, explicit = part, 'chain', None
+        joints = list(range(NUM_JOINTS)) if joints == 'all' else [int(j) for j in joints]
+        assert len(joints) > 0 and all(0 <= j < NUM_JOINTS for j in joints), \
+            'part {}: joints must be in [0, {}) (17 neck, 18 mid-hip)'.format(i, NUM_JOINTS)
+        assert len(set(joints)) == len(joints), 'part {}: duplicated joint'.format(i)
+        pos = {j: a for a, j in enumerate(joints)}
+        if explicit is not None:                       # edges given as joint ids
+            for e in explicit:
+                assert len(e) == 2 and e[0] in pos and e[1] in pos, \
+                    'part {}: edge {} must connect two joints of the part {}'.format(i, e, joints)
+            edges = [(pos[u], pos[v]) for u, v in explicit]
+        elif topology == 'chain':
+            edges = [(a, a + 1) for a in range(len(joints) - 1)]
+        elif topology == 'skeleton':
+            edges = [(pos[u], pos[v]) for u, v in SKELETON_EDGES if u in pos and v in pos]
+        else:
+            raise ValueError("part {}: topology must be 'chain' or 'skeleton'".format(i))
+        out.append((joints, edges))
+    return out
+
+
 class SkeletonParser(nn.Module):
     """
-    Keypoint coordinates [N, 17, 3] (x, y, conf)
-        -> normalized part coordinates [N, P, K, 2], part confidence [N, P, K], edge graph
+    keypoints [N, 17, 3] (x, y, conf)  ->  joint nodes of all parts + edge graph.
 
-    * adds virtual joints 17 = neck (mid-shoulder), 18 = mid-hip
+    * adds virtual joints 17 = neck (mid-shoulder), 18 = mid-hip, computed on the fly from the 17 COCO
+      keypoints (not needed in the data): position and confidence are the mean (= median of two) of
+      the two source joints (5, 6 / 11, 12), computed in one step. virtual_require_both=True: the
+      confidence is 0 if either source joint is below conf_thresh (its position is unreliable then)
     * center-normalization : subtract the mid-hip
     * scale-normalization  : divide by the per-frame body height (y-extent of confident joints)
+    * parsing: the joints of all parts are concatenated into V = sum(|part|) nodes, so parts can
+      have different sizes (e.g. full body = all 19 joints, the others 3). The graph is
+      block-diagonal (one block per part, parts never mix) and normalized as D^-1/2 A D^-1/2.
     * edge graph, two modes (ablation):
-        mode='data'  : fixed chain topology of every part + self loops, D^-1/2 A D^-1/2   -> [P, K, K]
-                       (pure coordinate data)
-        mode='image' : SkeletonGait heatmap convention - joints placed on a canvas where the body is
-                       `canvas_height` px tall and a Gaussian kernel exp(-d^2 / 2 sigma^2) (sigma=8)
-                       is added to the chain topology, re-normalized per frame          -> [N, P, K, K]
+        mode='data'  : fixed topology (chain / skeleton bones) + self loops               -> [V, V]
+        mode='image' : SkeletonGait++ heatmap convention - joint distances measured with the body
+                       `canvas_height` px tall, a Gaussian exp(-d^2 / 2 sigma^2) (sigma=8) of the
+                       distance between two joints of the same part is added:
+                       A = topology + alpha_part * Gaussian, re-normalized per frame       -> [N, V, V]
+                       edge_conf=True : Gaussian x conf_i * conf_j
+                       learn_alpha    : alpha_part learned per part (softplus, init edge_alpha);
+                                        otherwise alpha = edge_alpha for every part
     * augmentation (training only):
         frame_drop_prob : a whole frame's detection is lost (all confidences -> 0)
         joint_drop_prob : single joints are lost (confidence -> 0)
         joint_noise_std : Gaussian noise on the normalized coordinates (unit = body height)
-    No learnable parameters.
+    Learnable parameters: only alpha (image mode + learn_alpha).
     """
 
     def __init__(self, parts=None, conf_thresh=0.1, mode='data', edge_sigma=8.0, canvas_height=128.0,
-                 frame_drop_prob=0., joint_drop_prob=0., joint_noise_std=0.):
+                 frame_drop_prob=0., joint_drop_prob=0., joint_noise_std=0., edge_conf=False,
+                 edge_alpha=1.0, learn_alpha=False, virtual_require_both=True):
         super().__init__()
         self.frame_drop_prob, self.joint_drop_prob = frame_drop_prob, joint_drop_prob
         self.joint_noise_std = joint_noise_std
-        parts = DEFAULT_PARTS if parts is None else parts
-        K = len(parts[0])
-        assert all(len(p) == K for p in parts), 'every part needs the same number of joints'
         assert mode in ('data', 'image'), "skeleton mode must be 'data' or 'image'"
-        self.P, self.K = len(parts), K
+        parsed = parse_part_cfg(DEFAULT_PARTS if parts is None else parts)
+        self.P = len(parsed)
+        self.part_sizes = [len(j) for j, _ in parsed]
+        self.V = sum(self.part_sizes)
         self.conf_thresh = conf_thresh
         self.mode, self.edge_sigma, self.canvas_height = mode, edge_sigma, canvas_height
+        self.edge_conf = edge_conf
+        self.virtual_require_both = virtual_require_both
+        # source joints of the virtual joints 17 (neck) and 18 (mid-hip)
+        self.register_buffer('virtual_src', torch.tensor([[5, 6], [11, 12]]), persistent=False)
 
-        self.register_buffer('part_index', torch.tensor(parts, dtype=torch.long))  # [P, K]
-        A = torch.eye(K).repeat(self.P, 1, 1)
-        idx = torch.arange(K - 1)
-        A[:, idx, idx + 1] = 1.
-        A[:, idx + 1, idx] = 1.
-        self.register_buffer('topology', A)                                        # [P, K, K]
-        self.register_buffer('edge_graph', self._sym_norm(A))                      # [P, K, K]
+        index, part_of_node, A = [], [], torch.eye(self.V)
+        offset = 0
+        for p, (joints, edges) in enumerate(parsed):
+            index += joints
+            part_of_node += [p] * len(joints)
+            for a, b in edges:
+                A[offset + a, offset + b] = A[offset + b, offset + a] = 1.
+            offset += len(joints)
+        part_of_node = torch.tensor(part_of_node, dtype=torch.long)
+        same_part = (part_of_node[:, None] == part_of_node[None, :]).float()
+        # derived from the config -> not stored in checkpoints
+        self.register_buffer('joint_index', torch.tensor(index, dtype=torch.long), persistent=False)   # [V]
+        self.register_buffer('part_of_node', part_of_node, persistent=False)                            # [V]
+        self.register_buffer('topology', A, persistent=False)                                           # [V, V]
+        self.register_buffer('edge_graph', self._sym_norm(A), persistent=False)                         # [V, V]
+        self.register_buffer('gauss_mask', same_part * (1. - torch.eye(self.V)), persistent=False)      # [V, V]
+
+        self.learn_alpha = bool(learn_alpha) and mode == 'image'
+        if self.learn_alpha:
+            assert edge_alpha > 0, 'learn_alpha needs edge_alpha > 0 (initial value, softplus)'
+            raw = math.log(math.expm1(edge_alpha))
+            self.alpha_raw = nn.Parameter(torch.full((self.P,), raw))
+        else:
+            self.edge_alpha = float(edge_alpha)
+
+    def alpha(self):
+        """[P] weight of the Gaussian term of every part (image mode)."""
+        if self.learn_alpha:
+            return F.softplus(self.alpha_raw)
+        return torch.full((self.P,), self.edge_alpha, device=self.topology.device)
 
     @staticmethod
     def _sym_norm(A):
@@ -156,6 +268,7 @@ class SkeletonParser(nn.Module):
         return d.unsqueeze(-1) * A * d.unsqueeze(-2)
 
     def forward(self, kpts):
+        """kpts [N, 17, 3] -> p_xy [N, V, 2], p_conf [N, V], graph [V, V] or [N, V, V]"""
         N, J, _ = kpts.shape
         xy, conf = kpts[..., :2], kpts[..., 2].clamp(0, 1)
 
@@ -164,13 +277,14 @@ class SkeletonParser(nn.Module):
         if self.training and self.joint_drop_prob > 0:
             conf = conf * (torch.rand(N, J, device=conf.device) >= self.joint_drop_prob).to(conf.dtype)
 
-        # virtual joints
-        neck = (xy[:, 5] + xy[:, 6]) / 2
-        midhip = (xy[:, 11] + xy[:, 12]) / 2
-        xy = torch.cat([xy, neck[:, None], midhip[:, None]], 1)                      # [N, 19, 2]
-        conf = torch.cat([conf,
-                          torch.min(conf[:, 5], conf[:, 6])[:, None],
-                          torch.min(conf[:, 11], conf[:, 12])[:, None]], 1)          # [N, 19]
+        # virtual joints 17 (neck), 18 (mid-hip): mean of (x, y, conf) of the two source joints in one step
+        src = torch.cat([xy, conf.unsqueeze(-1)], -1)[:, self.virtual_src]            # [N, 2, 2, 3]
+        virt = src.mean(2)                                                            # [N, 2, 3]
+        v_conf = virt[..., 2]
+        if self.virtual_require_both:     # a missing source joint makes the midpoint unreliable
+            v_conf = v_conf * (src[..., 2].min(-1)[0] >= self.conf_thresh).to(v_conf.dtype)
+        xy = torch.cat([xy, virt[..., :2]], 1)                                        # [N, 19, 2]
+        conf = torch.cat([conf, v_conf], 1)                                           # [N, 19]
 
         # center normalization
         xy = xy - xy[:, 18:19]
@@ -186,18 +300,20 @@ class SkeletonParser(nn.Module):
         if self.training and self.joint_noise_std > 0:
             xy = xy + torch.randn_like(xy) * self.joint_noise_std
 
-        # parsing [N, 19, .] -> [N, P, K, .]
-        flat = self.part_index.view(-1)
-        p_xy = xy[:, flat].view(N, self.P, self.K, 2)
-        p_conf = conf[:, flat].view(N, self.P, self.K)
+        # parsing [N, 19, .] -> [N, V, .]
+        p_xy = xy[:, self.joint_index]
+        p_conf = conf[:, self.joint_index]
 
         if self.mode == 'data':
             return p_xy, p_conf, self.edge_graph
-        # mode == 'image': Gaussian kernel on the heatmap canvas
-        d = torch.cdist(p_xy.float(), p_xy.float()) * self.canvas_height           # [N, P, K, K] (px)
-        gauss = torch.exp(-d.pow(2) / (2 * self.edge_sigma ** 2))
-        off_diag = 1. - torch.eye(self.K, device=kpts.device)
-        A = self.topology.unsqueeze(0) + gauss * off_diag
+        # mode == 'image': Gaussian kernel on the heatmap canvas, only between joints of the same part
+        d = torch.cdist(p_xy.float(), p_xy.float()) * self.canvas_height           # [N, V, V] (px)
+        gauss = torch.exp(-d.pow(2) / (2 * self.edge_sigma ** 2)) * self.gauss_mask
+        if self.edge_conf:
+            c = p_conf.float()
+            gauss = gauss * c.unsqueeze(-1) * c.unsqueeze(-2)                          # conf_i * conf_j
+        alpha = self.alpha()[self.part_of_node]                                       # [V]
+        A = self.topology.unsqueeze(0) + alpha.view(1, -1, 1) * gauss
         return p_xy, p_conf, self._sym_norm(A).to(kpts.dtype)
 
 
@@ -206,7 +322,7 @@ def joint_features(p_xy, p_conf, n, s, seqL=None, use_velocity=True):
     Per-joint input features for the GCN.
         position : (x * c, y * c, c)                                   -> 3 channels
         velocity : (x_t - x_{t-1}, y_t - y_{t-1}) * min(c_t, c_{t-1})   -> +2 channels
-    p_xy [n*s, P, K, 2], p_conf [n*s, P, K]; frames are ordered as n sequences of s frames
+    p_xy [n*s, V, 2], p_conf [n*s, V]; frames are ordered as n sequences of s frames
     (training) or one concatenation of len(seqL) sequences (test, n = 1).
     The first frame of every sequence gets zero velocity.
     """
@@ -225,7 +341,7 @@ def joint_features(p_xy, p_conf, n, s, seqL=None, use_velocity=True):
 
 
 class PartGraphConv(nn.Module):
-    """X' = ReLU(BN(A X W)),  X: [N, P, K, Cin], A: [N, P, K, K] or [P, K, K]"""
+    """X' = ReLU(BN(A X W)),  X: [N, V, Cin], A: [N, V, V] or [V, V] (block-diagonal over parts)"""
 
     def __init__(self, in_channels, out_channels, dropout=0.1):
         super().__init__()
@@ -253,24 +369,32 @@ class PartGCNBlock(nn.Module):
 
 class PartGCNEncoder(nn.Module):
     """
-    parts [N, P, K, 3] + graph -> GCN [N, P, K, D] -> joint attention pooling -> [N, P, D]
-    GCN weights are shared by all parts; a learnable joint embedding tells them apart.
+    joint nodes [N, V, Cin] + block-diagonal graph -> GCN [N, V, D] -> joint attention pooling
+    inside every part -> [N, P, D]. Parts may have different numbers of joints.
+    GCN weights are shared by all parts; a learnable node embedding tells the joints apart.
     """
 
-    def __init__(self, num_parts=8, num_joints=3, in_channels=3, hidden_dim=64, dim=128, dropout=0.1):
+    def __init__(self, part_of_node, in_channels=3, hidden_dim=64, dim=128, dropout=0.1):
         super().__init__()
+        part_of_node = torch.as_tensor(part_of_node, dtype=torch.long)
+        self.P, self.V = int(part_of_node.max()) + 1, len(part_of_node)
+        member = part_of_node[None, :] == torch.arange(self.P)[:, None]               # [P, V]
+        self.register_buffer('member', member, persistent=False)
         self.input_proj = nn.Linear(in_channels, hidden_dim)
-        self.joint_embedding = nn.Parameter(torch.randn(num_parts, num_joints, hidden_dim) * 0.02)
+        self.joint_embedding = nn.Parameter(torch.randn(self.V, hidden_dim) * 0.02)
         self.gcn1 = PartGCNBlock(hidden_dim, hidden_dim, dropout)
         self.gcn2 = PartGCNBlock(hidden_dim, dim, dropout)
         self.joint_pool = PartAttentionPooling(dim)
 
-    def forward(self, parts, A, conf):
-        N, P, K, _ = parts.shape
-        x = self.input_proj(parts) + self.joint_embedding
-        x = self.gcn2(self.gcn1(x, A), A)                                 # [N, P, K, D]
-        pooled = self.joint_pool(x.reshape(N * P, K, -1), conf.reshape(N * P, K).float())
-        return pooled.view(N, P, -1)
+    def forward(self, nodes, A, conf):
+        x = self.input_proj(nodes) + self.joint_embedding
+        x = self.gcn2(self.gcn1(x, A), A)                                              # [N, V, D]
+        # attention pooling (PartAttentionPooling scores) restricted to the joints of each part
+        scores = self.joint_pool.attention(x).squeeze(-1)                              # [N, V]
+        scores = scores + torch.log(conf.float().clamp(min=1e-6)).to(scores.dtype)
+        scores = scores.unsqueeze(1).masked_fill(~self.member, float('-inf'))          # [N, P, V]
+        weights = torch.softmax(scores, dim=-1)
+        return torch.einsum('npv,nvd->npd', weights, x)                                # [N, P, D]
 
 
 # =============================================================================
