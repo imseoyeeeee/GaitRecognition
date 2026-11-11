@@ -97,7 +97,7 @@ model_cfg:
       - [6, 8, 10]    # right arm
       - [11, 13, 15]  # left leg
       - [12, 14, 16]  # right leg
-      - [11, 17, 12]  # dress
+      - {joints: [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18], topology: skeleton}   # dress: every joint except the head (0-4)   (previous: [11, 17, 12])
   augmentation:                      # training only; 0 disables each one
     frame_drop_prob: 0.05            # skeleton: a whole frame's detection is lost
     joint_drop_prob: 0.05            # skeleton: single joints are lost
