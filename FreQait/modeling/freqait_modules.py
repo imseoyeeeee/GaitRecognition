@@ -54,6 +54,33 @@ SKELETON_EDGES = [
 # =============================================================================
 # Silhouette (EFD) branch
 # =============================================================================
+def efd_to_ellipse(coeffs):
+    """
+    EFD coefficients [..., 4] = (a, b, c, d) of one harmonic,  x = a cos + b sin,  y = c cos + d sin
+    -> ellipse parameters [..., 6] = (A, B, e cos 2phi, e sin 2phi, A cos 2theta, A sin 2theta)
+
+    Closed-form 2x2 SVD  [[a, b], [c, d]] = Rot(phi) diag(A, B) Rot(theta):
+        A     semi-major axis (>= 0)
+        B     semi-minor axis, signed (sign = direction in which the contour is traversed)
+        phi   orientation of the major axis (pi-periodic -> 2 phi)   : rotation of the part (limb swing)
+        theta phase / start point on the ellipse (-> 2 theta)
+    The angles are weighted by how well they are defined: the orientation by the elongation
+    e = A - |B| (undefined for a circle) and the phase by A (undefined for a vanishing harmonic),
+    so near-circular / tiny harmonics give ~0 instead of noisy unit vectors and the features are
+    continuous. Computed in fp32, no learnable parameters.
+    """
+    a, b, c, d = coeffs.float().unbind(-1)
+    E, F_, G, H = (a + d) / 2, (a - d) / 2, (c + b) / 2, (c - b) / 2
+    Q, R = torch.sqrt(E ** 2 + H ** 2), torch.sqrt(F_ ** 2 + G ** 2)
+    A, B = Q + R, Q - R
+    a1, a2 = torch.atan2(G, F_), torch.atan2(H, E)
+    two_phi, two_theta = a1 + a2, a2 - a1
+    e = A - B.abs()
+    out = torch.stack([A, B, e * torch.cos(two_phi), e * torch.sin(two_phi),
+                       A * torch.cos(two_theta), A * torch.sin(two_theta)], -1)
+    return out.to(coeffs.dtype)
+
+
 class EFDEncoder(nn.Module):
     """
     EFD [N, P, H_all, Co] -> [N, P, D]
@@ -66,6 +93,15 @@ class EFDEncoder(nn.Module):
        EFD magnitudes decay quickly with the harmonic order
     3. 1D CNN along the (selected) harmonic axis (shared by all parts) + harmonic / part embeddings
     4. harmonic self-attention + attention pooling over harmonics
+
+    Ablation options:
+        input   : 'raw'     (a, b, c, d) per harmonic
+                  'ellipse' ellipse parameters per harmonic (efd_to_ellipse, 6 features)
+        embed   : 'cnn'     1D CNN along the harmonic axis (mixes neighbouring harmonics)
+                  'mlp'     the same small MLP on every harmonic (no mixing; attention relates harmonics)
+                  (used by encoder 'attention' only)
+        encoder : 'attention' embed -> harmonic self-attention -> attention pooling (steps 3-4)
+                  'mlp'       one MLP on all (harmonic, feature) values of a part (baseline)
     Parts whose contour is missing (all-zero EFD) are replaced by a learnable token. "Missing" is
     one fixed vector per part, so the appearance / disappearance of a part over time stays a
     pattern for the temporal model.
@@ -79,8 +115,14 @@ class EFDEncoder(nn.Module):
 
     def __init__(self, num_parts=8, harmonics=32, num_coeffs=4, dim=128,
                  attn_layers=1, num_heads=4, dropout=0.1, num_harmonics=None,
-                 harmonic_drop_prob=0., harmonic_drop_scope='sequence', harmonic_drop_keep_first=True):
+                 harmonic_drop_prob=0., harmonic_drop_scope='sequence', harmonic_drop_keep_first=True,
+                 input='raw', embed='cnn', encoder='attention', mlp_hidden=256):
         super().__init__()
+        assert input in ('raw', 'ellipse'), "efd.input must be 'raw' or 'ellipse'"
+        assert embed in ('cnn', 'mlp'), "efd.embed must be 'cnn' or 'mlp'"
+        assert encoder in ('attention', 'mlp'), "efd.encoder must be 'attention' or 'mlp'"
+        assert input == 'raw' or num_coeffs == 4, "efd.input 'ellipse' needs the 4 EFD coefficients (num_coeffs: 4)"
+        self.input, self.embed, self.encoder = input, embed, encoder
         assert 0. <= harmonic_drop_prob < 1., 'harmonic_drop_prob must be in [0, 1)'
         assert harmonic_drop_scope in ('sequence', 'frame'), "harmonic_drop_scope must be 'sequence' or 'frame'"
         self.harmonic_drop_prob = harmonic_drop_prob
@@ -94,24 +136,41 @@ class EFDEncoder(nn.Module):
         num_harmonics = len(index)
         self.register_buffer('harmonic_index', torch.tensor(index, dtype=torch.long), persistent=False)
         self.P, self.H, self.Co, self.D = num_parts, num_harmonics, num_coeffs, dim
+        self.F = 6 if input == 'ellipse' else num_coeffs                   # features per harmonic
 
-        self.norm = nn.BatchNorm1d(num_harmonics * num_coeffs)
-        self.cnn = nn.Sequential(
-            nn.Conv1d(num_coeffs, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(64), nn.GELU(),
-            nn.Conv1d(64, 96, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(96), nn.GELU(),
-            nn.Conv1d(96, dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(dim), nn.GELU(),
-        )
+        self.norm = nn.BatchNorm1d(num_harmonics * self.F)
+        self.missing_token = nn.Parameter(torch.zeros(num_parts, dim))
+        if encoder == 'mlp':
+            # baseline: one MLP on the flattened [H * F] values of a part (shared by the parts)
+            self.mlp_in = nn.Linear(num_harmonics * self.F, mlp_hidden)
+            self.mlp_part = nn.Parameter(torch.randn(num_parts, mlp_hidden) * 0.02)
+            self.mlp_out = nn.Sequential(
+                nn.LayerNorm(mlp_hidden), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(mlp_hidden, mlp_hidden), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(mlp_hidden, dim))
+            return
+        if embed == 'cnn':
+            self.cnn = nn.Sequential(
+                nn.Conv1d(self.F, 64, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm1d(64), nn.GELU(),
+                nn.Conv1d(64, 96, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm1d(96), nn.GELU(),
+                nn.Conv1d(96, dim, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm1d(dim), nn.GELU(),
+            )
+        else:
+            # the same MLP on every harmonic token (no mixing of neighbouring harmonics)
+            self.harmonic_mlp = nn.Sequential(
+                nn.Linear(self.F, 64), nn.GELU(),
+                nn.Linear(64, dim), nn.GELU(),
+            )
         self.harmonic_embedding = nn.Parameter(torch.randn(1, num_harmonics, dim) * 0.02)
         self.part_embedding = nn.Parameter(torch.randn(num_parts, 1, dim) * 0.02)
         self.attention = nn.Sequential(*[TransformerBlock(dim, num_heads, dropout) for _ in range(attn_layers)])
         self.pooling = HarmonicAttentionPooling(dim)
-        self.missing_token = nn.Parameter(torch.zeros(num_parts, dim))
 
     def harmonic_dropout(self, x, n):
-        """x [N*P, H, Co] (normalized), N = n sequences x s frames -> harmonics zeroed at random."""
+        """x [N*P, H, F] (normalized), N = n sequences x s frames -> harmonics zeroed at random."""
         if not self.training or self.harmonic_drop_prob <= 0:
             return x
         NP = x.shape[0]
@@ -138,14 +197,23 @@ class EFDEncoder(nn.Module):
                 tuple(efd.shape), self.P, max_index, self.Co)
         x = efd.index_select(2, self.harmonic_index).reshape(N * P, self.H, Co)
         valid = x.abs().sum(dim=(1, 2)) > 0                               # [NP]
+        if self.input == 'ellipse':
+            x = efd_to_ellipse(x)                                         # [NP, H, 6]
 
-        x = self.norm(x.reshape(N * P, self.H * Co)).reshape(N * P, self.H, Co)
+        x = self.norm(x.reshape(N * P, self.H * self.F)).reshape(N * P, self.H, self.F)
         x = self.harmonic_dropout(x, n)
-        x = self.cnn(x.transpose(1, 2)).transpose(1, 2)                    # [NP, H, D]
-        x = x + self.harmonic_embedding
-        x = (x.view(N, P, self.H, self.D) + self.part_embedding).view(N * P, self.H, self.D)
-        x = self.attention(x)                                             # [NP, H, D]
-        x = self.pooling(x).view(N, P, self.D)                            # [N, P, D]
+        if self.encoder == 'mlp':
+            h = self.mlp_in(x.reshape(N * P, self.H * self.F)).view(N, P, -1) + self.mlp_part
+            x = self.mlp_out(h)                                           # [N, P, D]
+        else:
+            if self.embed == 'cnn':
+                x = self.cnn(x.transpose(1, 2)).transpose(1, 2)            # [NP, H, D]
+            else:
+                x = self.harmonic_mlp(x)                                  # [NP, H, D]
+            x = x + self.harmonic_embedding
+            x = (x.view(N, P, self.H, self.D) + self.part_embedding).view(N * P, self.H, self.D)
+            x = self.attention(x)                                         # [NP, H, D]
+            x = self.pooling(x).view(N, P, self.D)                        # [N, P, D]
 
         missing = self.missing_token.unsqueeze(0).expand(N, -1, -1).to(x.dtype)
         return torch.where(valid.view(N, P, 1), x, missing)

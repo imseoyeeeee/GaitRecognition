@@ -61,6 +61,8 @@ loss_cfg:
     log_accuracy: true
 
 model_cfg:
+  # default = expected best combination: EFD8-unnorm data, ellipse input, mlp embed + harmonic attention,
+  #   skeleton image mode (learn_alpha, edge_conf, velocity), partwise + DTFPNet + part head, triplet + CE
   model: FreQait
   num_parts: 8
   dim: 128
@@ -69,15 +71,19 @@ model_cfg:
     # harmonics: [0, 1, 2, 3, 4, 5, 6, 7]          # e.g. low-frequency band only
     # harmonics: [0, 1, 2, 3, 5, 7, 11, 15, 23, 31] # e.g. sparse selection
     num_coeffs: 4
+    input: ellipse                   # ablation: raw (a, b, c, d) | ellipse (semi-axes, orientation, phase per harmonic)
+    encoder: attention               # ablation: attention (embed -> harmonic attention -> pooling) | mlp (one MLP, baseline)
+    embed: mlp                       # ablation (encoder: attention): cnn (1D CNN over harmonics) | mlp (per-harmonic MLP)
+    mlp_hidden: 256                  # hidden width of encoder: mlp
     attn_layers: 1
     num_heads: 4
     dropout: 0.1
   skeleton:
-    mode: data                       # ablation: data (fixed edge graph [8,3,3]) | image (sigma Gaussian, SkeletonGait heatmap convention)
+    mode: image                      # ablation: data (fixed skeleton graph) | image (+ alpha * sigma Gaussian, SkeletonGait heatmap convention)
     use_velocity: true               # ablation: add joint velocity (frame difference) to the GCN input (3 -> 5 channels)
     edge_sigma: 8.0                  # used only in image mode
     canvas_height: 128.0             # used only in image mode (body height in px)
-    edge_conf: false                 # image mode only: multiply the Gaussian edge weight by conf_i * conf_j
+    edge_conf: true                  # image mode only: multiply the Gaussian edge weight by conf_i * conf_j
     edge_alpha: 1.0                  # image mode only: A = topology + alpha * Gaussian (initial value if learned)
     learn_alpha: true                # image mode only: learn alpha per part (softplus); false: fixed edge_alpha
     conf_thresh: 0.1                 # joints below this confidence are ignored for scale normalization
@@ -140,7 +146,7 @@ model_cfg:
       # trainer_cfg.sampler.frames_num_fixed; set clip_len: null to use the whole sequence at once.
       clip_stride: 15
   head:
-    type: global                     # ablation: global (one embedding) | part (one embedding per part, 8 bins)
+    type: part                       # ablation: global (one embedding) | part (one embedding per part, 8 bins)
     embed_dim: 256
   SeparateBNNecks:
     class_num: 3000                  # number of training IDs (Gait3D: 3000); used only with CrossEntropyLoss

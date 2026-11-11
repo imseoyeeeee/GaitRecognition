@@ -493,5 +493,13 @@ class BaseModel(MetaModel, nn.Module):
             v = results.get('scalar/test_accuracy/' + key)
             if v is not None:
                 lines.append('{:<14}: {:.2f}%'.format(name, float(v)))
+        # final result only (test phase, or the last evaluation of training): skeleton image-mode alpha per part
+        total_iter = model.engine_cfg.get('total_iter')
+        final = total_iter is None or model.iteration >= total_iter
+        parser = getattr(model, 'skeleton_parser', None)
+        if final and parser is not None and getattr(parser, 'mode', None) == 'image':
+            alpha = parser.alpha().detach().float().cpu().tolist()
+            lines.append('Skeleton alpha: [{}] ({})'.format(
+                ', '.join('{:.3f}'.format(a) for a in alpha), 'learned' if parser.learn_alpha else 'fixed'))
         lines.append('=' * len(lines[0]))
         model.msg_mgr.log_info('\n' + '\n'.join(lines))
