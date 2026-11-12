@@ -98,7 +98,7 @@ model_cfg:
     parts:
       - {joints: all, topology: skeleton}   # full body: all 19 joints   (previous setting: [15, 0, 16])
       - {joints: [0, 1, 2, 3, 4], topology: skeleton}      # head: nose-eyes-ears   (previous: [3, 0, 4])
-      - {joints: [5, 6, 11, 12], edges: [[5, 6], [6, 12], [12, 11], [11, 5]]}   # torso: shoulders-hips rectangle (previous: [5, 18, 6])
+      - {joints: [5, 6, 11, 12, 17, 18], edges: [[5, 6], [6, 12], [12, 11], [11, 5], [5, 17], [6, 17], [17, 18], [18, 11], [18, 12]]}   # torso: shoulders-hips rectangle + neck-mid-hip spine
       - [5, 7, 9]     # left arm
       - [6, 8, 10]    # right arm
       - [11, 13, 15]  # left leg
@@ -135,6 +135,10 @@ model_cfg:
       GRU_layers: 1
       dropout_size: [0.4, 0.5, 0.5]  # DTFPNet defaults
       arch: dyGIN2d
+      # test-time windows (as for the transformer): DTFPNet is trained on frames_num_fixed-frame clips,
+      # so longer test sequences are split into clip_len windows (step clip_stride) and averaged.
+      # Default clip_len = trainer_cfg.sampler.frames_num_fixed; clip_len: null = whole sequence.
+      clip_stride: 15
     transformer:
       dim: 128
       out_dim: 128

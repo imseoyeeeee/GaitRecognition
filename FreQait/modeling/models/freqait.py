@@ -86,7 +86,10 @@ class FreQait(BaseModel):
         # ---------------- Step 2 - temporal ----------------
         tmp_type = tmp_cfg.get('type', 'dtfpnet')
         if tmp_type == 'dtfpnet':
-            self.temporal = DTFPNet(num_nodes=frame_dim, num_parts=part_bins, **tmp_cfg.get('dtfpnet', {}))
+            dtf_cfg = dict(tmp_cfg.get('dtfpnet', {}))
+            if 'clip_len' not in dtf_cfg:   # default: the training clip length (test-time windows)
+                dtf_cfg['clip_len'] = self.cfgs['trainer_cfg']['sampler'].get('frames_num_fixed', 30)
+            self.temporal = DTFPNet(num_nodes=frame_dim, num_parts=part_bins, **dtf_cfg)
         elif tmp_type == 'transformer':
             ttf_cfg = dict(tmp_cfg.get('transformer', {}))
             if 'clip_len' not in ttf_cfg:   # default: the training clip length

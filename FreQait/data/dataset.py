@@ -22,8 +22,11 @@ class _NumpyCompatUnpickler(pickle.Unpickler):
 
 
 def load_pkl(path):
-    with open(path, 'rb') as f:
-        return _NumpyCompatUnpickler(f).load()
+    try:
+        with open(path, 'rb') as f:
+            return _NumpyCompatUnpickler(f).load()
+    except Exception as e:   # name the broken file (e.g. truncated by an interrupted extraction)
+        raise RuntimeError('cannot load {}: {}: {}'.format(path, type(e).__name__, e)) from e
 
 
 class DataSet(tordata.Dataset):

@@ -118,12 +118,19 @@ class DTFPNet(nn.Module):
         GRU_layers:    layers of the DCT-GRU
         dropout_size:  dropout after each stage
         arch:          'dyGIN2d' | 'dyGCN2d'
+        clip_len / clip_stride: test-time windows. Training clips have frames_num_fixed frames, and the
+                       DCT-GRU branch depends on the length (L frequency components, GRU over them), so
+                       in eval mode a sequence longer than clip_len is cut into clip_len-frame windows
+                       (step clip_stride, last window aligned to the end) and the window outputs are
+                       averaged. clip_len None: whole sequence at once.
     """
 
     def __init__(self, num_nodes=128, in_dim=32, hidden_dim=64, out_dim=128,
                  kern_size=(7, 5, 3), kern_size_mid=(6, 5, 3), groups=2, GRU_layers=1,
-                 dropout_size=(0.4, 0.5, 0.5), arch='dyGIN2d', num_parts=None):
+                 dropout_size=(0.4, 0.5, 0.5), arch='dyGIN2d', num_parts=None,
+                 clip_len=None, clip_stride=15):
         super().__init__()
+        self.clip_len, self.clip_stride = clip_len, clip_stride
         assert len(kern_size) == 3 and len(kern_size_mid) == 3 and len(dropout_size) == 3
         self.num_nodes = num_nodes
         self.num_graphs = groups
@@ -216,10 +223,22 @@ class DTFPNet(nn.Module):
         out:  [n or k, out_dim, bins]  (bins = 1, or num_parts)
         """
         if seqL is None:
-            return self._forward_batch(x)
+            return self._forward_clips(x)
         lengths = seqL[0].data.cpu().numpy().tolist()
         outs, start = [], 0
         for L in lengths:
-            outs.append(self._forward_batch(x[:, :, start:start + L]))
+            outs.append(self._forward_clips(x[:, :, start:start + L]))
             start += L
         return torch.cat(outs, 0)
+
+    def _forward_clips(self, x):
+        """eval: x [n, C, L] -> mean of the clip_len-frame window outputs [n, out_dim, bins]"""
+        n, C, L = x.shape
+        if self.training or not self.clip_len or L <= self.clip_len:
+            return self._forward_batch(x)
+        starts = list(range(0, L - self.clip_len + 1, self.clip_stride))
+        if starts[-1] != L - self.clip_len:
+            starts.append(L - self.clip_len)                    # cover the tail
+        clips = torch.stack([x[:, :, s:s + self.clip_len] for s in starts], 1)   # [n, k, C, clip]
+        out = self._forward_batch(clips.reshape(n * len(starts), C, self.clip_len))
+        return out.view(n, len(starts), *out.shape[1:]).mean(1)
