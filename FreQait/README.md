@@ -49,9 +49,21 @@ CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.launch --nproc_per_node=1 \
   main.py --cfgs configs/freqait/freqait_Gait3D.yaml --phase train --log_to_file
 
 CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.launch --nproc_per_node=1 \
-  main.py --cfgs configs/freqait/freqait_Gait3D.yaml --phase test
+  main.py --cfgs output/dtfp/mlpattention/train1/config.yaml --phase test \
+  --ckpt output/dtfp/mlpattention/train1/checkpoints/FreQait-60000.pt
 ```
 `evaluator_cfg.sampler.batch_size` must equal the number of GPUs.
+
+Every training run gets a new folder:
+```
+output/<temporal>/<spatial>/train<k>/      temporal: dtfp | transformer | set
+    checkpoints/<save_name>-<iter>.pt      spatial : cnnattention | mlpattention | mlp  (efd.embed + efd.encoder)
+    summary/   logs/                       k       : 1, 2, 3, ... (next free number)
+    settings.md                            settings the folder names do not show (dims, EFD input, skeleton, ...) + full config
+    config.yaml                            the training config
+```
+* Test: `--ckpt <checkpoint>` is required; the test log goes to that run folder. Use the run's `config.yaml` as `--cfgs`, so the model matches the checkpoint (you may still edit evaluator settings in it).
+* Resume a stopped training run: `--phase train --ckpt <run>/checkpoints/<save_name>-<iter>.pt` (continues in the same folder).
 
 ## 3. Probe-gallery protocol
 
@@ -78,7 +90,7 @@ Options: `exclude_same_view`, `per_view`, `ranks`.
   * `data`: fixed graph (part topology + self loops).
   * `image` (default config): SkeletonGait heatmap convention. Joint distances are measured with the body scaled to 128 px (`canvas_height`), and a Gaussian `exp(-d²/2σ²)` with σ = 8 (`edge_sigma`) is added to the chain topology, giving a per-frame graph `[N, 8, 3, 3]`. With `edge_conf: true` the Gaussian is multiplied by `conf_i * conf_j` (as SkeletonGait++ scales each joint heatmap by its confidence), so edges of low-confidence joints fall back to the chain topology. The Gaussian term is weighted per part: `A = topology + alpha * Gaussian`; `learn_alpha: true` learns `alpha` per part (softplus, initial `edge_alpha`, logged to tensorboard as `skeleton_alpha/part<i>` and printed with the final result: test phase or the last evaluation of training), `false` fixes it to `edge_alpha`.
 * Part aggregation ablation, `model_cfg.part_aggregation.type`: `partwise` (default; per-part Linear(128 → C/8) + concat, so DTFPNet's channel graph learns inter-part coordination over time) or `transformer` (transformer over the 8 parts + CLS, per frame).
-* `part_aggregation.out_dim` (C, = DTFPNet graph nodes) is 64 by default. DTFPNet's graph convolutions grow ~C², and C=128 is about 2.3× slower.
+* `part_aggregation.out_dim` (C) is 1024 by default (128 channels per part; 64 = 8 per part was a bottleneck). With `temporal.type: dtfpnet`, C is the number of DTFPNet graph nodes and its cost grows ~C², so use 128-256 there.
 * Temporal ablation, `model_cfg.temporal.type`: `dtfpnet` (default), `set` (max over frames, GaitSet-style baseline) or `transformer` (temporal transformer with sinusoidal positions + mean pooling). At test time DTFPNet and the transformer split sequences longer than `clip_len` (default = `frames_num_fixed`) into windows (step `clip_stride`) and averages the window embeddings. Set `clip_len: null` to feed the whole sequence. This matters for DTFPNet: its DCT-GRU branch sees L frequency components, so a model trained on 30-frame clips and tested on whole sequences (up to 720 frames) gets a different input (Gait3D: Rank-1 17.1% whole sequence vs 26.2% first 30 frames only).
 * Legacy configs (top-level `transformer` / `dtfpnet` keys) are converted to `part_aggregation.type: transformer` + `temporal.type: dtfpnet`, and old checkpoints (`transformer.*`, GIN `mlp`) still load.
 * DTFPNet is trained end-to-end. Its top-k graphs use a straight-through estimator: the forward pass is the original binary graph, and gradients flow to the graph embeddings. All parameters are used, so `find_unused_parameters: false`.

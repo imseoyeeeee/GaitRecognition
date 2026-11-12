@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from modeling import models
 from utils import config_loader, get_ddp_module, init_seeds, get_msg_mgr
+from utils.run_dir import new_train_dir, parse_ckpt, write_settings
 
 parser = argparse.ArgumentParser(description='Main program for FreQait.')
 parser.add_argument('--local_rank', type=int, default=0,
@@ -16,19 +17,18 @@ parser.add_argument('--cfgs', type=str,
 parser.add_argument('--phase', default='train',
                     choices=['train', 'test'], help="choose train or test phase")
 parser.add_argument('--log_to_file', action='store_true',
-                    help="log to file, default path is: output/<dataset>/<model>/<save_name>/<logs>/<Datetime>.txt")
-parser.add_argument('--iter', default=0, help="iter to restore")
+                    help="log to file: <run folder>/logs/<Datetime>.txt")
+parser.add_argument('--ckpt', type=str, default='',
+                    help="test: checkpoint to evaluate (required). train: resume from this checkpoint "
+                         "(same run folder). Without it, training starts in a new folder "
+                         "output/<temporal>/<spatial>/train<k>/")
 opt = parser.parse_args()
 
 
 def initialization(cfgs, training):
     msg_mgr = get_msg_mgr()
     engine_cfg = cfgs['trainer_cfg'] if training else cfgs['evaluator_cfg']
-    if isinstance(cfgs['data_cfg'], list):
-        dataset_names = "_".join([d['dataset_name'] for d in cfgs['data_cfg']])
-        output_path = os.path.join('output/', dataset_names,cfgs['model_cfg']['model'], engine_cfg['save_name'])
-    else:
-        output_path = os.path.join('output/', cfgs['data_cfg']['dataset_name'],cfgs['model_cfg']['model'], engine_cfg['save_name'])
+    output_path = cfgs['output_dir']
     if training:
         msg_mgr.init_manager(output_path, opt.log_to_file, engine_cfg['log_iter'],
                              engine_cfg['restore_hint'] if isinstance(engine_cfg['restore_hint'], (int)) else 0)
@@ -66,10 +66,28 @@ if __name__ == '__main__':
         raise ValueError("Expect number of available GPUs({}) equals to the world size({}).".format(
             torch.cuda.device_count(), torch.distributed.get_world_size()))
     cfgs = config_loader(opt.cfgs)
-    if opt.iter != 0:
-        cfgs['evaluator_cfg']['restore_hint'] = int(opt.iter)
-        cfgs['trainer_cfg']['restore_hint'] = int(opt.iter)
-
     training = (opt.phase == 'train')
+
+    # run folder: output/<temporal>/<spatial>/train<k>/ (see utils/run_dir.py)
+    if opt.ckpt:
+        run_dir, save_name, iteration = parse_ckpt(opt.ckpt)
+        if training:      # resume: same folder, same checkpoint names
+            cfgs['trainer_cfg']['save_name'] = save_name
+            cfgs['trainer_cfg']['restore_hint'] = iteration
+        else:
+            cfgs['evaluator_cfg']['restore_hint'] = os.path.abspath(opt.ckpt)
+    elif training:
+        if cfgs['trainer_cfg'].get('restore_hint', 0) not in (0, None):
+            raise ValueError('trainer_cfg.restore_hint is not used any more: resume with --ckpt <checkpoint>')
+        run_dir = [new_train_dir(cfgs) if torch.distributed.get_rank() == 0 else None]
+        torch.distributed.broadcast_object_list(run_dir, src=0)
+        run_dir = run_dir[0]
+        if torch.distributed.get_rank() == 0:
+            write_settings(cfgs, run_dir, opt.cfgs)
+    else:
+        raise ValueError('--phase test needs --ckpt <path to checkpoint .pt>')
+    cfgs['output_dir'] = run_dir
+
     initialization(cfgs, training)
+    get_msg_mgr().log_info('Run folder: {}'.format(run_dir))
     run_model(cfgs, training)

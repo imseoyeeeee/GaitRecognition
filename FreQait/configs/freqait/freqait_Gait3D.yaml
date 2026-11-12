@@ -15,7 +15,7 @@ data_cfg:
 evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: true
-  restore_hint: 60000
+  restore_hint: 0                    # not used: the test checkpoint is given with --ckpt <path>
   save_name: FreQait
   eval_func: evaluate_probe_gallery
   probe_gallery:
@@ -65,7 +65,7 @@ model_cfg:
   #   skeleton image mode (learn_alpha, edge_conf, velocity), partwise + DTFPNet + part head, triplet + CE
   model: FreQait
   num_parts: 8
-  dim: 128
+  dim: 256                           # part feature size D (EFD / skeleton / fusion)   (previous: 128)
   efd:
     harmonics: 32                    # int n: harmonics 0..n-1 | list: only these indices (0 = 1st harmonic)
     # harmonics: [0, 1, 2, 3, 4, 5, 6, 7]          # e.g. low-frequency band only
@@ -74,8 +74,8 @@ model_cfg:
     input: ellipse                   # ablation: raw (a, b, c, d) | ellipse (semi-axes, orientation, phase per harmonic)
     encoder: attention               # ablation: attention (embed -> harmonic attention -> pooling) | mlp (one MLP, baseline)
     embed: mlp                       # ablation (encoder: attention): cnn (1D CNN over harmonics) | mlp (per-harmonic MLP)
-    mlp_hidden: 256                  # hidden width of encoder: mlp
-    attn_layers: 1
+    mlp_hidden: 512                  # hidden width of encoder: mlp   (previous: 256)
+    attn_layers: 2                   # harmonic self-attention depth (ablation: 2 | 4; previous: 1)
     num_heads: 4
     dropout: 0.1
   skeleton:
@@ -89,7 +89,7 @@ model_cfg:
     conf_thresh: 0.1                 # joints below this confidence are ignored for scale normalization
     virtual_require_both: true       # virtual joints (17 neck, 18 mid-hip): conf = mean of the two source joints;
                                      #   true: 0 if either source joint is below conf_thresh
-    hidden_dim: 64
+    hidden_dim: 128                  # GCN width   (previous: 64)
     dropout: 0.1
     # parts: COCO-17 + 17 neck + 18 mid-hip, same order as the EFD parts. Parts may differ in size.
     #   [a, b, c]                         : chain topology (a-b, b-c)
@@ -117,8 +117,9 @@ model_cfg:
     dropout: 0.1
   part_aggregation:                  # [B, T, 8, 128] -> [B, T, C]
     type: partwise                   # ablation: partwise (per-part Linear + concat) | transformer
-    out_dim: 64                      # C (= temporal input channels / DTFPNet graph nodes), divisible by 8
-                                     #   64: 8 channels per part; DTFPNet graph cost grows ~C^2 (128 = previous setting)
+    out_dim: 1024                    # C (= temporal input channels), divisible by 8: 1024 = 128 channels per part
+                                     #   (64 = 8 per part was a bottleneck: set Rank-1 12% -> 21% with 512)
+                                     #   dtfpnet: C = DTFPNet graph nodes, cost grows ~C^2 -> use 128-256 there
     transformer:                     # used only when type: transformer
       num_layers: 2
       num_heads: 4
@@ -175,10 +176,10 @@ trainer_cfg:
   with_test: true
   log_iter: 100
   restore_ckpt_strict: true
-  restore_hint: 0
+  restore_hint: 0                    # keep 0; resume with --ckpt <checkpoint> (same run folder)
   save_iter: 5000                    # checkpoint (+ parameter count in the log)
   eval_iter: 1000                    # test + result summary (needs with_test: true); default = save_iter
-  save_name: FreQait
+  save_name: FreQait                 # checkpoint file prefix; runs go to output/<temporal>/<spatial>/train<k>/
   sync_BN: true
   total_iter: 60000
   sampler:

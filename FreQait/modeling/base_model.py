@@ -9,6 +9,7 @@ Typical usage:
 BaseModel.run_train(model)
 BaseModel.run_test(model)
 """
+import re
 import torch
 import numpy as np
 import os.path as osp
@@ -139,8 +140,8 @@ class BaseModel(MetaModel, nn.Module):
 
         if training and self.engine_cfg['enable_float16']:
             self.Scaler = GradScaler()
-        self.save_path = osp.join('output/', cfgs['data_cfg']['dataset_name'],
-                                  cfgs['model_cfg']['model'], self.engine_cfg['save_name'])
+        self.save_path = cfgs.get('output_dir') or osp.join(      # run folder (main.py / utils/run_dir.py)
+            'output/', cfgs['data_cfg']['dataset_name'], cfgs['model_cfg']['model'], self.engine_cfg['save_name'])
 
         self.build_network(cfgs['model_cfg'])
         self.init_parameters()
@@ -288,7 +289,8 @@ class BaseModel(MetaModel, nn.Module):
             self.iteration = restore_hint
         elif isinstance(restore_hint, str):
             save_name = restore_hint
-            self.iteration = 0
+            it = re.search(r'-(\d+)\.pt$', save_name)            # <save_name>-<iter>.pt
+            self.iteration = int(it.group(1)) if it else 0
         else:
             raise ValueError(
                 "Error type for -Restore_Hint-, supported: int or string.")
