@@ -142,7 +142,7 @@ model_cfg:
       # Default clip_len = trainer_cfg.sampler.frames_num_fixed; clip_len: null = whole sequence.
       clip_stride: 15
     p_dtfpnet:                       # P-DTFPNet: DTFPNet with the 8 parts as graph nodes (C/P features each); needs partwise
-      # graph A = part_graph + beta * exp(-(1 - c)^2 / sigma^2) on every entry (diagonal of the second term 0),
+      # time graph A = part_graph + beta * exp(-(1 - c)^2 / sigma^2) on every entry (diagonal of the second term 0),
       #   c = part coupling on signal_dim learned signals per part: time branch |correlation| per time group,
       #   frequency branch phase-invariant spectral coherence over the clip.  beta / sigma: initial values (learned)
       # part order: 0 full body, 1 head, 2 torso, 3 left arm, 4 right arm, 5 left leg, 6 right leg, 7 dress
@@ -158,6 +158,11 @@ model_cfg:
       signal_dim: 4
       beta: 1.0
       sigma: 0.5
+      # frequency graph = part_graph (+ coherence term) (+ learned term beta_F2 * sigmoid(E_g), E per time segment)
+      coherence: true
+      learned_graph: true
+      learned_init: 0.1              # initial sigmoid(E) of every entry
+      beta_learned: 1.0              # initial beta_F2
       in_dim: 32
       hidden_dim: 64
       out_dim: 128                   # per part; head global: out_dim * 8 channels (parts concatenated)

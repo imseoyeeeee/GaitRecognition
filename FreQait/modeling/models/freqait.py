@@ -6,7 +6,7 @@ from ..modules import SeparateFCs, SeparateBNNecks
 from ..freqait_modules import (EFDEncoder, SkeletonParser, PartGCNEncoder, AttentionFusion, joint_features,
                                PartwiseProjection, PartTransformer, TemporalTransformer, SetPooling)
 from ..dtfpnet import DTFPNet
-from ..p_dtfpnet import PDTFPNet
+from ..p_dtfpnet import PDTFPNet, part_names
 from utils import is_dict
 
 
@@ -167,6 +167,20 @@ class FreQait(BaseModel):
     def init_parameters(self):
         # keep PyTorch default initialisation (DTFPNet relies on it, see its README)
         pass
+
+    @torch.no_grad()
+    def learned_weights_report(self):
+        """text of the learned graph weights (skeleton alpha, P-DTFPNet graphs), written at the final test"""
+        lines = ['Learned weights (iteration {})'.format(self.iteration), '']
+        parser = self.skeleton_parser
+        if getattr(parser, 'mode', None) == 'image':
+            alpha = parser.alpha().float().cpu().tolist()
+            lines.append('Skeleton alpha ({}):'.format('learned' if parser.learn_alpha else 'fixed'))
+            lines += ['  {}: {:.4f}'.format(n, a) for n, a in zip(part_names(len(alpha)), alpha)]
+            lines.append('')
+        if hasattr(self.temporal, 'report'):
+            lines += self.temporal.report()
+        return '\n'.join(lines) + '\n'
 
     def modality_dropout(self, efd_feat, skl_feat, n, s):
         """training only: per sequence, drop the EFD or the skeleton features (each with prob p/2)."""

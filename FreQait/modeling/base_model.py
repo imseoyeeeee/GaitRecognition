@@ -9,6 +9,7 @@ Typical usage:
 BaseModel.run_train(model)
 BaseModel.run_test(model)
 """
+import os
 import re
 import torch
 import numpy as np
@@ -228,7 +229,8 @@ class BaseModel(MetaModel, nn.Module):
             # weight decay only on weight matrices; not on bias / norm / embeddings / tokens / alpha
             # (standard transformer practice: decay would shrink position embeddings and norm gains)
             no_decay_names = ('harmonic_embedding', 'part_embedding', 'joint_embedding', 'pos_embedding',
-                              'cls_token', 'missing_token', 'mlp_part', 'alpha_raw', 'emb_s', 'emb_t')
+                              'cls_token', 'missing_token', 'mlp_part', 'alpha_raw', 'emb_s', 'emb_t',
+                              'learned_E')
             def is_no_decay(n, p):
                 last = n.split('.')[-1]
                 return p.ndim <= 1 or last == 'bias' or last in no_decay_names
@@ -522,3 +524,9 @@ class BaseModel(MetaModel, nn.Module):
                 ', '.join('{:.3f}'.format(a) for a in alpha), 'learned' if parser.learn_alpha else 'fixed'))
         lines.append('=' * len(lines[0]))
         model.msg_mgr.log_info('\n' + '\n'.join(lines))
+        if final and hasattr(model, 'learned_weights_report'):
+            path = osp.join(model.save_path, 'learned_weights_iter{}.txt'.format(model.iteration))
+            os.makedirs(model.save_path, exist_ok=True)
+            with open(path, 'w') as f:
+                f.write(model.learned_weights_report())
+            model.msg_mgr.log_info('Learned weights saved: {}'.format(path))

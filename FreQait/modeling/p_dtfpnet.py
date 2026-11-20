@@ -5,7 +5,9 @@ DTFPNet treats every input channel as one scalar time series (one graph node). I
 C = P x C/P frame channels are P part vectors (PartwiseProjection concatenates the parts), so here
 
   * nodes    = the P parts, node features = the C/P channels of each part   x: [B, C/P, P, T]
-  * graph    = A = A_prior + beta * W    (all P x P entries, per sample and per time group)
+  * time graph      A_T = A_prior + beta_T * W_T
+    frequency graph A_F = A_prior + beta_F1 * W_F + beta_F2 * sigmoid(E_g)
+    (all P x P entries; W per sample, W_T and E_g per time group)
       A_prior : gait prior (model_cfg.temporal.p_dtfpnet.part_graph, P x P)
       W_ij    = exp(-(1 - c_ij)^2 / sigma^2),  diagonal 0, beta / sigma learned (softplus)
       c_ij    : coupling of parts i, j measured on k learned per-part signals s_i = W_i x_i
@@ -13,6 +15,8 @@ C = P x C/P frame channels are P part vectors (PartwiseProjection concatenates t
         frequency branch : phase-invariant spectral coherence over the whole clip
                            |sum_f S_i(f) S_j(f)*| / sqrt(sum_f |S_i|^2 sum_f |S_j|^2)  (f > 0, rFFT)
       both averaged over the k signals, in [0, 1].
+      E_g     : learned P x P matrix per time group (input independent, as the DTFPNet graphs), diagonal 0,
+                initialised so that sigmoid(E) = learned_init (0.1)
   * time / frequency branches, stages, GIN aggregation, dynamic carry between time groups and
     test-time windows are the ones of DTFPNet; the DCT-GRU runs per part over the part features.
 
@@ -37,6 +41,11 @@ DEFAULT_PART_GRAPH = [
     [1, 0, 0, 1, 1, 1, 1, 0],
     [1, 0, 0, 0, 0, 0, 0, 1],
 ]
+DEFAULT_PART_NAMES = ['full body', 'head', 'torso', 'left arm', 'right arm', 'left leg', 'right leg', 'dress']
+
+
+def part_names(P):
+    return DEFAULT_PART_NAMES if P == len(DEFAULT_PART_NAMES) else ['part {}'.format(i) for i in range(P)]
 
 
 def inv_softplus(v):
@@ -113,14 +122,18 @@ class PDTFPNet(nn.Module):
         head_part:  True -> [B, out_dim, P];  False -> [B, out_dim * P, 1]
         part_graph: P x P gait prior adjacency (default: DEFAULT_PART_GRAPH)
         signal_dim: k learned coupling signals per part
-        beta / sigma: initial values of the learned weight and width of the coupling term
+        beta / sigma: initial values of the learned weight and width of the coupling terms
+        coherence:     frequency graph uses the coherence term (beta_F1 * W_F)
+        learned_graph: frequency graph uses the learned term (beta_F2 * sigmoid(E_g))
+        learned_init:  initial sigmoid(E) of every entry;  beta_learned: initial beta_F2
         others: as DTFPNet
     """
     forward = DTFPNet.forward
     _forward_clips = DTFPNet._forward_clips
 
     def __init__(self, num_nodes=1024, num_parts=8, head_part=True, part_graph=None, signal_dim=4,
-                 beta=1.0, sigma=0.5, in_dim=32, hidden_dim=64, out_dim=128,
+                 beta=1.0, sigma=0.5, coherence=True, learned_graph=True, learned_init=0.1, beta_learned=1.0,
+                 in_dim=32, hidden_dim=64, out_dim=128,
                  kern_size=(7, 5, 3), kern_size_mid=(6, 5, 3), groups=2, GRU_layers=1,
                  dropout_size=(0.4, 0.5, 0.5), clip_len=None, clip_stride=15):
         super().__init__()
@@ -135,8 +148,16 @@ class PDTFPNet(nn.Module):
         self.clip_len, self.clip_stride = clip_len, clip_stride
         self.out_dim = out_dim if head_part else out_dim * P
 
+        self.register_buffer('prior', prior, persistent=False)
+        self.register_buffer('off_diag', 1. - torch.eye(P), persistent=False)
         self.g_time = CouplingGraph(prior, Cp, 'time', signal_dim, beta, sigma)
-        self.g_freq = CouplingGraph(prior, Cp, 'freq', signal_dim, beta, sigma)
+        self.g_freq = CouplingGraph(prior, Cp, 'freq', signal_dim, beta, sigma) if coherence else None
+        if learned_graph:
+            assert 0. < learned_init < 1., 'p_dtfpnet.learned_init must be in (0, 1)'
+            self.learned_E = nn.Parameter(torch.full((groups, P, P), math.log(learned_init / (1. - learned_init))))
+            self.beta_learned_raw = nn.Parameter(torch.tensor(inv_softplus(beta_learned)))
+        else:
+            self.learned_E = None
         self.asb_in = DCT_GRU(dim=Cp, GRU_layers=GRU_layers)          # per part, over its C/P features
         self.asb_mid = DCT_GRU(dim=in_dim, GRU_layers=GRU_layers)
 
@@ -154,6 +175,41 @@ class PDTFPNet(nn.Module):
         self.dropout_1, self.dropout_2, self.dropout_3 = dropout_size
         self.activation = nn.ReLU()
 
+    def learned_term(self):
+        """beta_F2 * sigmoid(E) with zero diagonal  [G, P, P]"""
+        return F.softplus(self.beta_learned_raw) * torch.sigmoid(self.learned_E.float()) * self.off_diag
+
+    def freq_graph(self, x):
+        """A_F = A_prior (+ beta_F1 * W_F) (+ beta_F2 * sigmoid(E_g))  ->  [B, G, P, P] fp32"""
+        if self.g_freq is not None:
+            adj = self.g_freq(x, self.num_graphs)
+        else:
+            adj = self.prior.expand(x.size(0), self.num_graphs, -1, -1)
+        if self.learned_E is not None:
+            adj = adj + self.learned_term().unsqueeze(0)
+        return adj
+
+    @torch.no_grad()
+    def report(self):
+        """learned graph weights as text lines (for the learned-weights file)"""
+        f = lambda v: '{:.4f}'.format(float(v))
+        lines = ['Time graph (|correlation| per time segment, groups = {}):'.format(self.num_graphs),
+                 '  beta: ' + f(self.g_time.beta), '  sigma: ' + f(self.g_time.sigma)]
+        if self.g_freq is not None:
+            lines += ['', 'Frequency graph 1 (coherence over the clip):',
+                      '  beta: ' + f(self.g_freq.beta), '  sigma: ' + f(self.g_freq.sigma)]
+        if self.learned_E is not None:
+            names = part_names(self.P)
+            lines += ['', 'Frequency graph 2 (learned E):',
+                      '  beta: ' + f(F.softplus(self.beta_learned_raw)),
+                      '  part order: [{}]'.format(', '.join(names)),
+                      '  sigmoid(E)[g][i][j] = weight of part j -> part i in time segment g (diagonal unused, 0)']
+            E = (torch.sigmoid(self.learned_E.float()) * self.off_diag).cpu().tolist()
+            for g, mat in enumerate(E):
+                rows = ',\n'.join('    [' + ', '.join('{:.4f}'.format(v) for v in row) + ']' for row in mat)
+                lines += ['  E segment {} = ['.format(g + 1) + '\n' + rows + '\n  ]']
+        return lines
+
     def _gru(self, asb, x):
         """DCT-GRU per part: x [B, C, P, L] -> [B, C, P, L]"""
         B, C, P, L = x.shape
@@ -168,7 +224,7 @@ class PDTFPNet(nn.Module):
         B, _, L = inputs.shape
         x = inputs.view(B, self.P, self.Cp, L).transpose(1, 2)            # [B, C/P, P, L]
         adj = self.g_time(x, self.num_graphs)
-        adj_fre = self.g_freq(x, self.num_graphs)
+        adj_fre = self.freq_graph(x)
         fre_asb = self._gru(self.asb_in, x)
 
         # stage 1: time branch / frequency branch (shared convs), then merge
