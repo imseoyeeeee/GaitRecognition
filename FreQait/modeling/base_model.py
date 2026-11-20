@@ -222,9 +222,25 @@ class BaseModel(MetaModel, nn.Module):
     def get_optimizer(self, optimizer_cfg):
         self.msg_mgr.log_info(optimizer_cfg)
         optimizer = get_attr_from([optim], optimizer_cfg['solver'])
-        valid_arg = get_valid_args(optimizer, optimizer_cfg, ['solver'])
-        optimizer = optimizer(
-            filter(lambda p: p.requires_grad, self.parameters()), **valid_arg)
+        valid_arg = get_valid_args(optimizer, optimizer_cfg, ['solver', 'no_decay_norm_embed'])
+        params = [(n, p) for n, p in self.named_parameters() if p.requires_grad]
+        if optimizer_cfg.get('no_decay_norm_embed', False):
+            # weight decay only on weight matrices; not on bias / norm / embeddings / tokens / alpha
+            # (standard transformer practice: decay would shrink position embeddings and norm gains)
+            no_decay_names = ('harmonic_embedding', 'part_embedding', 'joint_embedding', 'pos_embedding',
+                              'cls_token', 'missing_token', 'mlp_part', 'alpha_raw', 'emb_s', 'emb_t')
+            def is_no_decay(n, p):
+                last = n.split('.')[-1]
+                return p.ndim <= 1 or last == 'bias' or last in no_decay_names
+            decay = [p for n, p in params if not is_no_decay(n, p)]
+            no_decay = [p for n, p in params if is_no_decay(n, p)]
+            self.msg_mgr.log_info('Weight decay on {} tensors ({:.3f}M), none on {} tensors ({:.3f}M)'.format(
+                len(decay), sum(p.numel() for p in decay) / 1e6,
+                len(no_decay), sum(p.numel() for p in no_decay) / 1e6))
+            groups = [{'params': decay}, {'params': no_decay, 'weight_decay': 0.0}]
+        else:
+            groups = [p for _, p in params]
+        optimizer = optimizer(groups, **valid_arg)
         return optimizer
 
     def get_scheduler(self, scheduler_cfg):
@@ -387,7 +403,8 @@ class BaseModel(MetaModel, nn.Module):
         info_dict = Odict()
         for inputs in self.test_loader:
             ipts = self.inputs_pretreament(inputs)
-            with autocast(enabled=self.engine_cfg['enable_float16']):
+            # always fp32 at test time: fp16 overflows on some test sequences and corrupts the ranking
+            with autocast(enabled=False):
                 retval = self.forward(ipts)
                 inference_feat = retval['inference_feat']
                 for k, v in inference_feat.items():

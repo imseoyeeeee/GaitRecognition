@@ -6,6 +6,7 @@ from ..modules import SeparateFCs, SeparateBNNecks
 from ..freqait_modules import (EFDEncoder, SkeletonParser, PartGCNEncoder, AttentionFusion, joint_features,
                                PartwiseProjection, PartTransformer, TemporalTransformer, SetPooling)
 from ..dtfpnet import DTFPNet
+from ..p_dtfpnet import PDTFPNet
 from utils import is_dict
 
 
@@ -23,7 +24,7 @@ class FreQait(BaseModel):
     Step 2 (fusion)
         [modality dropout] -> SkeletonGait++ attention fusion                      [n, s, 8, D]
         part aggregation -> [n, s, C]            (part_aggregation.type: partwise | transformer)
-    Step 2 (temporal) -> [n, C', bins]           (temporal.type: dtfpnet | transformer | set)
+    Step 2 (temporal) -> [n, C', bins]           (temporal.type: dtfpnet | p_dtfpnet | transformer | set)
     Head                                         (head.type: global (bins=1) | part (bins=8))
         SeparateFCs -> embedding [n, E, bins] -> triplet;  BNNeck -> CE if CrossEntropyLoss is in loss_cfg
 
@@ -90,6 +91,14 @@ class FreQait(BaseModel):
             if 'clip_len' not in dtf_cfg:   # default: the training clip length (test-time windows)
                 dtf_cfg['clip_len'] = self.cfgs['trainer_cfg']['sampler'].get('frames_num_fixed', 30)
             self.temporal = DTFPNet(num_nodes=frame_dim, num_parts=part_bins, **dtf_cfg)
+        elif tmp_type == 'p_dtfpnet':
+            if agg_type != 'partwise':
+                raise ValueError("temporal.type 'p_dtfpnet' needs part_aggregation.type 'partwise' "
+                                 "(its graph nodes are the parts of the frame feature).")
+            p_cfg = dict(tmp_cfg.get('p_dtfpnet', {}))
+            if 'clip_len' not in p_cfg:    # default: the training clip length (test-time windows)
+                p_cfg['clip_len'] = self.cfgs['trainer_cfg']['sampler'].get('frames_num_fixed', 30)
+            self.temporal = PDTFPNet(num_nodes=frame_dim, num_parts=P, head_part=head_type == 'part', **p_cfg)
         elif tmp_type == 'transformer':
             ttf_cfg = dict(tmp_cfg.get('transformer', {}))
             if 'clip_len' not in ttf_cfg:   # default: the training clip length
@@ -98,7 +107,7 @@ class FreQait(BaseModel):
         elif tmp_type == 'set':
             self.temporal = SetPooling(num_nodes=frame_dim, num_parts=part_bins)
         else:
-            raise ValueError("temporal.type must be 'dtfpnet', 'transformer' or 'set'")
+            raise ValueError("temporal.type must be 'dtfpnet', 'p_dtfpnet', 'transformer' or 'set'")
 
         # ---------------- Head ----------------
         bins = part_bins or 1

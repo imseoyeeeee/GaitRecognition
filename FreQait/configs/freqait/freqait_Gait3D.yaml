@@ -1,8 +1,8 @@
 data_cfg:
   dataset_name: Gait3D
   dataset_root:                      # one folder per modality, order = [EFD, keypoints]
-    - your_path/Gait3D/efd           #   <root>/<ID>/<CAM>/<SEQ>/<SEQ>.pkl  (or <root>/<ID>/<CAM>/<SEQ>.pkl)
-    - your_path/Gait3D/pose
+    - /home/user/GaitRecognition-Dataset/EFD8-unnorm           #   <root>/<ID>/<CAM>/<SEQ>/<SEQ>.pkl  (or <root>/<ID>/<CAM>/<SEQ>.pkl)
+    - /home/user/GaitRecognition-Dataset/Gait3D-pose-pkl
   # dataset_root: your_path/merged   # alternative: single merged folder (datasets/merge_efd_pose.py)
   max_len_diff: 5                    # EFD / pose frame numbers are trimmed to the shorter one; warn above this
   dataset_partition: ./datasets/Gait3D/Gait3D.json
@@ -13,7 +13,7 @@ data_cfg:
   test_dataset_name: Gait3D
 
 evaluator_cfg:
-  enable_float16: true
+  enable_float16: false
   restore_ckpt_strict: true
   restore_hint: 0                    # not used: the test checkpoint is given with --ckpt <path>
   save_name: FreQait
@@ -44,8 +44,8 @@ evaluator_cfg:
 #   skeleton      : mode data | image,  use_velocity true | false
 #   augmentation  : set a probability / std to 0 to disable it
 #   part_aggregation.type : partwise | transformer
-#   temporal.type         : dtfpnet | transformer | set
-#   head.type             : global | part   (part: needs partwise + dtfpnet/set)
+#   temporal.type         : dtfpnet | p_dtfpnet | transformer | set   (p_dtfpnet: needs partwise)
+#   head.type             : global | part   (part: needs partwise + dtfpnet/p_dtfpnet/set)
 # ---------------------------------------------------------------------------
 loss_cfg:
   - loss_term_weight: 1.0
@@ -72,7 +72,7 @@ model_cfg:
     # harmonics: [0, 1, 2, 3, 5, 7, 11, 15, 23, 31] # e.g. sparse selection
     num_coeffs: 4
     input: ellipse                   # ablation: raw (a, b, c, d) | ellipse (semi-axes, orientation, phase per harmonic)
-    encoder: attention               # ablation: attention (embed -> harmonic attention -> pooling) | mlp (one MLP, baseline)
+    encoder: mlp               # ablation: attention (embed -> harmonic attention -> pooling) | mlp (one MLP, baseline)
     embed: mlp                       # ablation (encoder: attention): cnn (1D CNN over harmonics) | mlp (per-harmonic MLP)
     mlp_hidden: 512                  # hidden width of encoder: mlp   (previous: 256)
     attn_layers: 2                   # harmonic self-attention depth (ablation: 2 | 4; previous: 1)
@@ -107,7 +107,7 @@ model_cfg:
   augmentation:                      # training only; 0 disables each one
     frame_drop_prob: 0.05            # skeleton: a whole frame's detection is lost
     joint_drop_prob: 0.05            # skeleton: single joints are lost
-    joint_noise_std: 0.01            # skeleton: Gaussian noise on normalized coordinates (unit = body height)
+    joint_noise_std: 0.02            # skeleton: Gaussian noise on normalized coordinates (unit = body height)
     modality_drop_prob: 0.1          # per sequence: EFD or skeleton features are zeroed (each p/2)
     harmonic_drop_prob: 0.1          # EFD: each harmonic is switched off (normalized coefficients -> 0)
     harmonic_drop_scope: sequence    # sequence: same harmonics off in every frame (per part) | frame: per frame
@@ -124,8 +124,9 @@ model_cfg:
       num_layers: 2
       num_heads: 4
       dropout: 0.1
+      out_norm: true
   temporal:                          # [B, C, T] -> [B, C', bins]
-    type: dtfpnet                    # ablation: dtfpnet | transformer | set (max over frames, GaitSet-style)
+    type: p_dtfpnet                  # ablation: dtfpnet | p_dtfpnet | transformer | set (max over frames, GaitSet-style)
     dtfpnet:
       in_dim: 32
       hidden_dim: 64
@@ -140,6 +141,32 @@ model_cfg:
       # so longer test sequences are split into clip_len windows (step clip_stride) and averaged.
       # Default clip_len = trainer_cfg.sampler.frames_num_fixed; clip_len: null = whole sequence.
       clip_stride: 15
+    p_dtfpnet:                       # P-DTFPNet: DTFPNet with the 8 parts as graph nodes (C/P features each); needs partwise
+      # graph A = part_graph + beta * exp(-(1 - c)^2 / sigma^2) on every entry (diagonal of the second term 0),
+      #   c = part coupling on signal_dim learned signals per part: time branch |correlation| per time group,
+      #   frequency branch phase-invariant spectral coherence over the clip.  beta / sigma: initial values (learned)
+      # part order: 0 full body, 1 head, 2 torso, 3 left arm, 4 right arm, 5 left leg, 6 right leg, 7 dress
+      part_graph:
+        - [1, 1, 1, 1, 1, 1, 1, 1]
+        - [1, 1, 0, 0, 0, 0, 0, 0]
+        - [1, 0, 1, 0, 0, 0, 0, 0]
+        - [1, 0, 0, 1, 1, 1, 1, 0]
+        - [1, 0, 0, 1, 1, 1, 1, 0]
+        - [1, 0, 0, 1, 1, 1, 1, 0]
+        - [1, 0, 0, 1, 1, 1, 1, 0]
+        - [1, 0, 0, 0, 0, 0, 0, 1]
+      signal_dim: 4
+      beta: 1.0
+      sigma: 0.5
+      in_dim: 32
+      hidden_dim: 64
+      out_dim: 128                   # per part; head global: out_dim * 8 channels (parts concatenated)
+      kern_size: [7, 5, 3]
+      kern_size_mid: [6, 5, 3]
+      groups: 2
+      GRU_layers: 1
+      dropout_size: [0.4, 0.5, 0.5]
+      clip_stride: 15                # test-time windows, as dtfpnet
     transformer:
       dim: 128
       out_dim: 128
@@ -151,7 +178,7 @@ model_cfg:
       # trainer_cfg.sampler.frames_num_fixed; set clip_len: null to use the whole sequence at once.
       clip_stride: 15
   head:
-    type: part                       # ablation: global (one embedding) | part (one embedding per part, 8 bins)
+    type: global                       # ablation: global (one embedding) | part (one embedding per part, 8 bins)
     embed_dim: 256
   SeparateBNNecks:
     class_num: 3000                  # number of training IDs (Gait3D: 3000); used only with CrossEntropyLoss
@@ -160,14 +187,15 @@ model_cfg:
 optimizer_cfg:
   solver: AdamW
   lr: 0.001
-  weight_decay: 0.0001
+  weight_decay: 0.03
+  no_decay_norm_embed: true
 
 scheduler_cfg:
   scheduler: MultiStepLR
   gamma: 0.1
   milestones:
     - 30000
-    - 50000
+    - 36000
 
 trainer_cfg:
   enable_float16: true
@@ -181,7 +209,7 @@ trainer_cfg:
   eval_iter: 1000                    # test + result summary (needs with_test: true); default = save_iter
   save_name: FreQait                 # checkpoint file prefix; runs go to output/<temporal>/<spatial>/train<k>/
   sync_BN: true
-  total_iter: 60000
+  total_iter: 40000
   sampler:
     batch_shuffle: true
     batch_size:

@@ -19,7 +19,7 @@ from time import localtime, strftime
 
 import yaml
 
-TEMPORAL_NAMES = {'dtfpnet': 'dtfp', 'transformer': 'transformer', 'set': 'set'}
+TEMPORAL_NAMES = {'dtfpnet': 'dtfp', 'p_dtfpnet': 'pdtfp', 'transformer': 'transformer', 'set': 'set'}
 
 
 def temporal_name(model_cfg):

@@ -515,19 +515,22 @@ class PartwiseProjection(nn.Module):
 class PartTransformer(nn.Module):
     """[N, P, D] part tokens + CLS -> transformer encoder -> CLS projected to [N, C]"""
 
-    def __init__(self, num_parts=8, dim=128, out_dim=128, num_layers=2, num_heads=4, dropout=0.1):
+    def __init__(self, num_parts=8, dim=128, out_dim=128, num_layers=2, num_heads=4, dropout=0.1, out_norm=False):
         super().__init__()
         self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
         self.pos_embedding = nn.Parameter(torch.randn(1, num_parts + 1, dim) * 0.02)
         self.blocks = nn.Sequential(*[TransformerBlock(dim, num_heads, dropout) for _ in range(num_layers)])
         self.norm = nn.LayerNorm(dim)
         self.proj = nn.Linear(dim, out_dim)
+        # LayerNorm on the output (as PartwiseProjection): bounded scale, no fp16 overflow.
+        # default False so checkpoints trained without it still load
+        self.out_norm = nn.LayerNorm(out_dim) if out_norm else nn.Identity()
 
     def forward(self, x):
         N = x.size(0)
         x = torch.cat([self.cls_token.expand(N, -1, -1).to(x.dtype), x], 1) + self.pos_embedding
         x = self.blocks(x)
-        return self.proj(self.norm(x[:, 0]))
+        return self.out_norm(self.proj(self.norm(x[:, 0])))
 
 
 # =============================================================================

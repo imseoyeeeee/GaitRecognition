@@ -64,7 +64,7 @@ class DynamicGINConv2d(nn.Module):
         G = adj.size(0)
         adj = self.norm(adj).to(x.dtype)
         x = x.reshape(B, C, N, G, -1).transpose(2, 3)                    # [B, C, G, N, F//G]
-        out = torch.matmul(adj, x)
+        out = torch.einsum('gnm,bcgmf->bcgnf', adj, x)   # no broadcast copy of adj (memory)
         out = torch.cat([out[:, :, :1], out[:, :, 1:] + x[:, :, :-1]], 2)  # dynamic: add previous group
         if add_loop:
             out = (1 + self.eps) * x + out
